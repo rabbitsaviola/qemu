@@ -100,6 +100,12 @@ config MAX78000FTHR
     depends on TCG && ARM
     select MAX78000_SOC
 
+config SIFLI_SF32LB52X
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_V7M
+
 config MPS3R
     bool
     default y
