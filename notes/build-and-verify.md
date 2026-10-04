@@ -10,7 +10,7 @@
 | 文件 | 用途 |
 |---|---|
 | `build-sifli.sh` | 本地构建（configure 过就跳过，日常只跑 ninja） |
-| `verify-sifli.sh` | 一条命令跑完九项检查，退出码可直接进 CI |
+| `verify-sifli.sh` | 一条命令跑完八项检查，退出码可直接进 CI |
 | `qtest-sifli.sh` | 单独验外设写路径，被 verify 的第 8 项调用 |
 | `peripherals.md` | 外设模型是怎么设计的、怎么加新的 |
 | `build-and-verify.md` | 本文 |
@@ -109,31 +109,51 @@ if (data->implements_type &&
 `cortex-m33` 就在 `target/arm/tcg/cpu-v7m.c`，区别只是 `TARGET_AARCH64` /
 `TARGET_LONG_BITS` 宏。实测同一份固件在 aarch64 上输出完全一致。
 
-### ② 功能回归 —— 跑真实固件
+### ② 功能回归 —— 跑真实板子固件
+
+这是唯一一项能证伪的检查：SDK 原样 scons 构建、**固件一行不改**，跑真实板子。
 
 ```bash
 cd ~/build-sifli
-timeout 10 ./qemu-system-arm -M sf32lb52x -nographic \
-  -semihosting -semihosting-config enable=on,target=native \
-  -kernel /mnt/e/code2/qemu-support/example/qemu/hello_qemu/project/build_qemu_cortex_m33_hcpu/main.elf
+timeout 60 ./qemu-system-arm -M sf32lb52x -nographic \
+  -kernel /mnt/e/code2/SiFli-SDK/example/get-started/hello_world/rtt/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
 ```
 
-期望输出：
+期望最后两行：
 
 ```
- \ | /
-- SiFli Corporation
- / | \     build on Aug  2 2026, 0.0.0 build "Unknown"
- 2020 - 2022 Copyright by SiFli team
-Hello SiFli on QEMU!
+Hello world!
+msh />
 ```
 
-把 `qemu-system-arm` 换成 `qemu-system-aarch64` 应该完全一样。
+跑满 60 秒是因为固件**停在 shell 上等输入、永远不会自己退出**——这是个上限，
+不是耗时。没跑到的才叫失败。
 
-**注意**：这个输出走的是 **ARM semihosting**，不是 UART——固件通过 `BKPT 0xAB`
-调用宿主服务（`SYS_WRITEC`/`SYS_WRITE0`），QEMU 在 `semihosting/arm-compat-semi.c` 里实现。
-**不加 `-semihosting` 会 fault**。所以「能打印」只证明内存/CPU/NVIC/SysTick/启动流程对了，
-**一个字的外设都没验证**。
+**不带 `-semihosting`，这是重点。** 固件的 `rt_kprintf` 走完整链路：
+
+```
+rt_kprintf → drv_usart.c 的 sifli_putc → 写 USART1->TDR
+           → sifli-usart 模型 → chardev → stdout
+```
+
+链路上任何一环断了，一行字都出不来。而**带上 `-semihosting` 就等于绕开了要验的
+东西**——那会让固件用 `BKPT 0xAB` 把字符直接交给宿主（`semihosting/arm-compat-semi.c`），
+一个 HAL 寄存器都不碰。
+
+> 早先这里跑的是 `qemu-support` 的 `hello_qemu`（`qemu_cortex_m33` 桩板），
+> 它走 semihosting，只证明内存/CPU/NVIC/SysTick 对了。真实 HAL 能跑之后那一项
+> 就被这项完全覆盖，删掉了。
+
+固件构建：
+
+```bash
+cd <SDK>/example/get-started/hello_world/rtt/project
+scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+```
+
+**注意两棵树的固件不一样**：`SiFli-SDK` 和 `qemu-support` 的 `hello_world`
+源码不同（一个打 `Hello world3!`，一个打 `Hello world!`），`ptab.yaml` 的分区
+布局也不同。报问题时要说清用的是哪棵树的固件。
 
 ### ③ 代码格式
 
@@ -183,21 +203,12 @@ git log -1 --format=%B | grep -E "^(Signed-off-by|Co-Authored-By)"
 上面每一项都是 `notes/verify-sifli.sh` 里的一个检查项：
 
 ```bash
-bash notes/verify-sifli.sh            # 默认固件
-bash notes/verify-sifli.sh fw.elf     # 换第 5 项那个冒烟固件
-bash notes/verify-sifli.sh -          # 跳过第 5 项
+bash notes/verify-sifli.sh                       # 默认固件
+SIFLI_REAL_FW=/path/to/main.elf bash notes/verify-sifli.sh   # 换固件
+SIFLI_REAL_FW=- bash notes/verify-sifli.sh       # 跳过固件那一项
 ```
 
-两个固件是两个独立的东西：第 5 项的冒烟固件走 semihosting 桩，第 9 项的真实板子
-固件走完整 HAL。第 9 项那个用环境变量指定：
-
-```bash
-SIFLI_REAL_FW=/path/to/main.elf bash notes/verify-sifli.sh
-# 或跳过它（也是 "-"）
-SIFLI_REAL_FW=- bash notes/verify-sifli.sh
-```
-
-九项检查，全部通过退出码 0，可直接进 CI：
+八项检查，全部通过退出码 0，可直接进 CI：
 
 | # | 检查 | 性质 |
 |---|---|---|
@@ -205,22 +216,21 @@ SIFLI_REAL_FW=- bash notes/verify-sifli.sh
 | 2 | 两个二进制里 `-M help` 都能看到 sf32lb52x | |
 | 3 | checkpatch 0 errors 0 warnings | |
 | 4 | 工作区行尾是 LF（不是 CRLF） | |
-| 5 | `hello_qemu` 能跑出 banner | 冒烟（走 semihosting，不碰 HAL）|
-| 6 | 提交带 Signed-off-by 且与 author 一致 | |
-| 7 | 外设区域都映射了，寄存器读回值正确 | 结构性 |
-| 8 | 外设写路径（qtest） | 结构性 |
-| **9** | **真实板子固件跑到 `main()` 和 msh 提示符** | **真正的验收** |
+| 5 | 提交带 Signed-off-by 且与 author 一致 | |
+| 6 | 外设区域都映射了，寄存器读回值正确 | 结构性 |
+| 7 | 外设写路径（qtest） | 结构性 |
+| **8** | **真实板子固件跑到 `main()` 和 msh 提示符** | **真正的验收** |
 
-**第 9 项才是关键。** 第 5 项的 `hello_qemu` 走 semihosting 桩，一个 HAL 寄存器
-都不碰；第 7、8 项只是读几个寄存器。只有 SDK 原样构建的真实板子固件、一行不改
-地跑到 `main()`，才能证明整个 HAL 真的在模型上跑起来了——时钟树、电源、RTC、
-MPI、音频、控制台，整条链路。详见 `peripherals.md`。
+**第 8 项才是关键。** 第 6、7 项只是读几个寄存器，**模型写错了它们照样能过**
+——`peripherals.md` §6.2 那个 DWT 映射错位的坑就骗过了它们全部。只有 SDK 原样
+构建的真实板子固件、一行不改地跑到 `main()`，才能证明整个 HAL 真的在模型上跑
+起来了——时钟树、电源、RTC、MPI、音频、控制台，整条链路。
 
 不跑脚本时手工至少查这几条：
 
 ```
 □ 两个二进制的 -M help 都能看到 sf32lb52x
-□ 固件能跑出 "Hello SiFli on QEMU!"
+□ 真实板子固件能跑出 "Hello world!" 和 msh 提示符（不带 -semihosting）
 □ checkpatch 0 errors 0 warnings
 □ git ls-files --eol 显示 w/lf（不是 w/crlf）
 □ git diff --stat 只有自己的改动

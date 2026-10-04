@@ -3,20 +3,19 @@
 # sifli-qemu 验证脚本。检查项与说明见同目录的 build-and-verify.md。
 #
 # 用法：
-#   bash notes/verify-sifli.sh [固件.elf]
+#   bash notes/verify-sifli.sh
 #
-# 固件默认用 qemu-support 里的 hello_qemu；传 "-" 可跳过固件这一项。
 # 全部通过退出码为 0，有失败为 1（可直接用于 CI）。
 #
 # 环境变量可覆盖：
 #   SIFLI_QEMU_SRC    源码树   （默认 ~/code/sifli-qemu）
 #   SIFLI_QEMU_BUILD  构建目录 （默认 ~/build-sifli）
+#   SIFLI_REAL_FW     真实板子固件；传 "-" 跳过那一项
 
 set -u
 
 SRC=${SIFLI_QEMU_SRC:-$HOME/code/sifli-qemu}
 BUILD=${SIFLI_QEMU_BUILD:-$HOME/build-sifli}
-FW=${1:-/mnt/e/code2/qemu-support/example/qemu/hello_qemu/project/build_qemu_cortex_m33_hcpu/main.elf}
 
 FAILED=0
 pass() { echo "  [PASS] $*"; }
@@ -101,27 +100,8 @@ else
 fi
 echo
 
-# ------------------------------------------------------------ 5. 固件功能
-echo "[5] 固件功能回归"
-if [ "$FW" = "-" ]; then
-    skip "按要求跳过"
-elif [ ! -f "$FW" ]; then
-    fail "固件不存在：$FW"
-else
-    out=$(timeout 15 "$BUILD/qemu-system-arm" -M sf32lb52x -nographic \
-              -semihosting -semihosting-config enable=on,target=native \
-              -kernel "$FW" 2>&1 | grep -v '^QEMU [0-9]\|^(qemu)\|terminating')
-    if echo "$out" | grep -q "Hello SiFli on QEMU"; then
-        pass "固件启动并打印 banner"
-    else
-        fail "固件没打出预期内容，实际输出："
-        echo "$out" | head -8 | sed 's/^/         /'
-    fi
-fi
-echo
-
-# ----------------------------------------------------------- 6. 提交完整性
-echo "[6] 提交完整性"
+# ----------------------------------------------------------- 5. 提交完整性
+echo "[5] 提交完整性"
 if [ -d "$SRC/.git" ]; then
     last=$(cd "$SRC" && git log -1 --format=%B)
     author=$(cd "$SRC" && git log -1 --format='%an <%ae>')
@@ -140,10 +120,10 @@ else
 fi
 echo
 
-# --------------------------------------------------------------- 7. 外设模型
+# --------------------------------------------------------------- 6. 外设模型
 # 表注册 / 设备创建 / 地址映射 / 强制位，这条链上任何一环断了，机器照样能启动，
 # 只是固件读到一片 0 然后卡在某个 while 里。所以直接从 monitor 读回寄存器。
-echo "[7] 外设模型（寄存器回读）"
+echo "[6] 外设模型（寄存器回读）"
 if [ ! -x "$BUILD/qemu-system-arm" ]; then
     skip "二进制不存在"
 else
@@ -203,9 +183,9 @@ EOF
 fi
 echo
 
-# --------------------------------------------------------- 8. 写路径（qtest）
-# 第 7 项只能读，写路径单独用 qtest 验。说明见 qtest-sifli.sh。
-echo "[8] 写路径（qtest）"
+# --------------------------------------------------------- 7. 写路径（qtest）
+# 第 6 项只能读，写路径单独用 qtest 验。说明见 qtest-sifli.sh。
+echo "[7] 写路径（qtest）"
 if [ -f "$SRC/notes/qtest-sifli.sh" ]; then
     if out=$(SIFLI_QEMU_BUILD="$BUILD" bash "$SRC/notes/qtest-sifli.sh" 2>&1); then
         pass "RCC 使能别名（ESR/ECR→ENR）与普通寄存器读写"
@@ -218,18 +198,19 @@ else
 fi
 echo
 
-# ------------------------------------------------------- 9. 真实板子固件
+# ------------------------------------------------------- 8. 真实板子固件
 # 这一项才是真正的验收。
 #
-# 第 5 项那个 hello_qemu 走 semihosting 桩，一个 HAL 寄存器都不碰；第 7、8 项
-# 只是结构性地读几个寄存器。只有这里——SDK 原样构建的真实板子固件、一行不改
-# ——能证明整个 HAL 真的在模型上跑起来了：时钟树、电源、RTC、MPI、音频、
-# 控制台，一路到 main() 和 RT-Thread 的 shell。
+# 第 6、7 项只是结构性地读几个寄存器，模型写错了它们照样能过
+# （peripherals.md §6.2 那个 DWT 映射错位的坑就骗过了它们全部）。只有这里
+# ——SDK 原样构建的真实板子固件、一行不改——能证明整个 HAL 真的在模型上跑
+# 起来了：时钟树、电源、RTC、MPI、音频、控制台，一路到 main() 和 RT-Thread
+# 的 shell。
 #
 # 固件用 scons 构建：
 #   cd <SDK>/example/get-started/hello_world/rtt/project
 #   scons --board=sf32lb52-lcd_a128r16_hcpu -j8
-echo "[9] 真实板子固件（sf32lb52-lcd_a128r16 hello_world）"
+echo "[8] 真实板子固件（sf32lb52-lcd_a128r16 hello_world）"
 REAL_FW=${SIFLI_REAL_FW:-/mnt/e/code2/SiFli-SDK/example/get-started/hello_world/rtt/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf}
 if [ "$REAL_FW" = "-" ]; then
     skip "按要求跳过"

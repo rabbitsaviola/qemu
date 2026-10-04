@@ -448,7 +448,7 @@ Hello world3!
 msh />
 ```
 
-跑到 `main()` 并停在 RT-Thread 的 msh 提示符上。`notes/verify-sifli.sh` 第 9 项
+跑到 `main()` 并停在 RT-Thread 的 msh 提示符上。`notes/verify-sifli.sh` 第 8 项
 就是跑这个。
 
 ### 6.8 规律
