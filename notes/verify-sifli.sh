@@ -219,9 +219,24 @@ elif [ ! -f "$REAL_FW" ]; then
 else
     # 不带 -semihosting：固件必须走真实的 HAL UART 驱动，走我们的 USART 模型，
     # 输出经 chardev 到 stdout。带了 -semihosting 就等于绕开了要验的东西。
-    # sed 去掉 RT-Thread 日志的 ANSI 颜色码（[32;22m...）。
-    out=$(timeout 60 "$BUILD/qemu-system-arm" -M sf32lb52x -nographic \
-              -kernel "$REAL_FW" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+    #
+    # 固件跑到 shell 就停在那儿等输入，永远不会自己退出，所以只能看着输出把它
+    # 杀掉。不这么做的话这一项要白等满 60 秒——实测 2.6 秒就到底了。
+    log=$(mktemp)
+    timeout 60 "$BUILD/qemu-system-arm" -M sf32lb52x -nographic \
+        -kernel "$REAL_FW" > "$log" 2>&1 &
+    qpid=$!
+    for _ in $(seq 1 600); do          # 600 × 0.1s，和上面那个 timeout 对齐
+        grep -q 'msh />' "$log" 2>/dev/null && break
+        kill -0 "$qpid" 2>/dev/null || break   # QEMU 自己退了（出错）就别等了
+        sleep 0.1
+    done
+    kill "$qpid" 2>/dev/null
+    wait "$qpid" 2>/dev/null
+
+    # sed 去掉 RT-Thread 日志的 ANSI 颜色码（[32;22m...）
+    out=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
+    rm -f "$log"
 
     missing=""
     echo "$out" | grep -q "Hello world" || missing="$missing main()输出"
