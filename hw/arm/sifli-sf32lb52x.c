@@ -33,6 +33,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/sf32lb52x.h"
 #include "hw/char/sifli-usart.h"
+#include "hw/dma/sifli-dma.h"
 #include "hw/misc/armv7m_dwt.h"
 #include "hw/misc/sifli-regbank.h"
 #include "system/system.h"
@@ -234,6 +235,29 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         object_property_add_child(OBJECT(machine), b->bank, OBJECT(dev));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, b->base);
+    }
+
+    /*
+     * Both DMA controllers, with all eight channels of each.
+     *
+     * DMAC2 is built even though nothing on this board drives it from the
+     * HCPU -- the firmware still probes it, and a peripheral it does not
+     * find is a peripheral it may try to bring up differently.
+     */
+    for (i = 0; i < sf32lb52x_num_dmas; i++) {
+        const Sf32lb52xDma *d = &sf32lb52x_dmas[i];
+        g_autofree char *name = g_strdup_printf("dmac%u", d->id);
+        DeviceState *dev = qdev_new(TYPE_SIFLI_DMA);
+        unsigned c;
+
+        object_property_add_child(OBJECT(machine), name, OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, d->base);
+
+        for (c = 0; c < SF32LB52X_IRQ_DMA_NUM; c++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), c,
+                               qdev_get_gpio_in(armv7m, d->irq + c));
+        }
     }
 
     /*

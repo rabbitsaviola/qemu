@@ -818,15 +818,61 @@ const Sf32lb52xRegBank sf32lb52x_reg_banks[] = {
 const unsigned sf32lb52x_num_reg_banks = ARRAY_SIZE(sf32lb52x_reg_banks);
 
 /*
+ * Both DMA controllers are modelled. The HAL allocates channels by taking the
+ * first free one and may move a request between them, so all eight channels
+ * of each are live; see the CSELR note in hw/dma/sifli-dma.c.
+ */
+const Sf32lb52xDma sf32lb52x_dmas[] = {
+    {
+        .id = SF32LB52X_DMA_1,
+        .base = SF32LB52X_DMAC1_BASE,
+        .irq = SF32LB52X_IRQ_DMAC1_CH1,
+    }, {
+        .id = SF32LB52X_DMA_2,
+        .base = SF32LB52X_DMAC2_BASE,
+        .irq = SF32LB52X_IRQ_DMAC2_CH1,
+    },
+};
+
+const unsigned sf32lb52x_num_dmas = ARRAY_SIZE(sf32lb52x_dmas);
+
+/*
  * All five USARTs are modelled. Only the first is wired to a chardev by the
  * machine; the rest exist so that firmware probing them does not hang.
+ *
+ * The DMA request numbers come from customer/boards/.../sf32lb52x/dma_config.h
+ * and are named in include/hw/arm/sf32lb52x.h. They are a property of the
+ * board's routing rather than of the SoC, but every board in the SDK uses the
+ * same ones, and a request number that nothing answers to only means a
+ * reference firmware never gets its bytes.
  */
 const Sf32lb52xUsart sf32lb52x_usarts[] = {
-    { .base = SF32LB52X_USART1_BASE, .irq = SF32LB52X_IRQ_USART1 },
-    { .base = SF32LB52X_USART2_BASE, .irq = SF32LB52X_IRQ_USART2 },
-    { .base = SF32LB52X_USART3_BASE, .irq = SF32LB52X_IRQ_USART3 },
-    { .base = SF32LB52X_USART4_BASE, .irq = SF32LB52X_IRQ_USART4 },
-    { .base = SF32LB52X_USART5_BASE, .irq = SF32LB52X_IRQ_USART5 },
+    {
+        .base = SF32LB52X_USART1_BASE,
+        .irq = SF32LB52X_IRQ_USART1,
+        .dma_ctrl = SF32LB52X_DMA_1,
+        .dma_rx_req = SF32LB52X_REQ_USART1_RX,
+    }, {
+        .base = SF32LB52X_USART2_BASE,
+        .irq = SF32LB52X_IRQ_USART2,
+        .dma_ctrl = SF32LB52X_DMA_1,
+        .dma_rx_req = SF32LB52X_REQ_USART2_RX,
+    }, {
+        .base = SF32LB52X_USART3_BASE,
+        .irq = SF32LB52X_IRQ_USART3,
+        .dma_ctrl = SF32LB52X_DMA_1,
+        .dma_rx_req = SF32LB52X_REQ_USART3_RX,
+    }, {
+        .base = SF32LB52X_USART4_BASE,
+        .irq = SF32LB52X_IRQ_USART4,
+        .dma_ctrl = SF32LB52X_DMA_2,
+        .dma_rx_req = SF32LB52X_REQ_USART4_RX,
+    }, {
+        .base = SF32LB52X_USART5_BASE,
+        .irq = SF32LB52X_IRQ_USART5,
+        .dma_ctrl = SF32LB52X_DMA_2,
+        .dma_rx_req = SF32LB52X_REQ_USART5_RX,
+    },
 };
 
 const unsigned sf32lb52x_num_usarts = ARRAY_SIZE(sf32lb52x_usarts);

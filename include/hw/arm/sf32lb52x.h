@@ -76,6 +76,8 @@
 #define SF32LB52X_GPTIM2_BASE       0x500b0000ULL
 #define SF32LB52X_BTIM1_BASE        0x50092000ULL
 #define SF32LB52X_BTIM2_BASE        0x500b1000ULL
+#define SF32LB52X_DMAC1_BASE        0x50081000ULL
+#define SF32LB52X_DMAC2_BASE        0x40001000ULL
 #define SF32LB52X_CRC1_BASE         0x50048000ULL
 #define SF32LB52X_GPIO1_BASE        0x500a0000ULL
 #define SF32LB52X_GPIO2_BASE        0x40080000ULL
@@ -106,13 +108,130 @@ typedef struct Sf32lb52xRegBank {
     uint64_t base;
 } Sf32lb52xRegBank;
 
+/* Which DMA controller serves a peripheral; SF32LB52X_DMA_NONE for neither. */
+#define SF32LB52X_DMA_NONE          0
+#define SF32LB52X_DMA_1             1
+#define SF32LB52X_DMA_2             2
+
+/*
+ * DMA request numbers -- the value firmware writes into CSELRn.CnS to make a
+ * channel serve a given peripheral. Transcribed from the SDK's
+ * customer/boards/include/config/sf32lb52x/dma_config.h, which calls the same
+ * signals UARTn_*_DMA_REQUEST; the PWMT/PWMA entries are that file's aliases
+ * for the PWM mode of the same timer, kept so a lookup by either name works.
+ *
+ * A number means nothing on its own: it is an index into one controller's
+ * request table, and the numbering restarts at zero for each, so USART1_RX is
+ * request 5 of DMAC1 while USART4_RX is request 1 of DMAC2. No signal appears
+ * on both controllers, so the names carry only the signal -- which controller
+ * a number belongs to is what the two groups below are for, as in the SDK.
+ */
+
+/* Served by DMAC1 (HPSYS). */
+#define SF32LB52X_REQ_FLASH1          0
+#define SF32LB52X_REQ_FLASH2          1
+#define SF32LB52X_REQ_I2C4            3
+#define SF32LB52X_REQ_USART1_TX       4
+#define SF32LB52X_REQ_USART1_RX       5
+#define SF32LB52X_REQ_USART2_TX       6
+#define SF32LB52X_REQ_USART2_RX       7
+#define SF32LB52X_REQ_GPTIM1_UPDATE   8
+#define SF32LB52X_REQ_GPTIM1_TRIGGER  9
+#define SF32LB52X_REQ_GPTIM1_CC1      10
+#define SF32LB52X_REQ_GPTIM1_CC2      11
+#define SF32LB52X_REQ_GPTIM1_CC3      12
+#define SF32LB52X_REQ_GPTIM1_CC4      13
+#define SF32LB52X_REQ_PWMT1_UPDATE    SF32LB52X_REQ_GPTIM1_UPDATE
+#define SF32LB52X_REQ_PWMT1_TRIGGER   SF32LB52X_REQ_GPTIM1_TRIGGER
+#define SF32LB52X_REQ_PWMT1_CC1       SF32LB52X_REQ_GPTIM1_CC1
+#define SF32LB52X_REQ_PWMT1_CC2       SF32LB52X_REQ_GPTIM1_CC2
+#define SF32LB52X_REQ_PWMT1_CC3       SF32LB52X_REQ_GPTIM1_CC3
+#define SF32LB52X_REQ_PWMT1_CC4       SF32LB52X_REQ_GPTIM1_CC4
+#define SF32LB52X_REQ_BTIM1           14
+#define SF32LB52X_REQ_BTIM2           15
+#define SF32LB52X_REQ_ATIM1_UPDATE    16
+#define SF32LB52X_REQ_ATIM1_TRIGGER   17
+#define SF32LB52X_REQ_ATIM1_CC1       18
+#define SF32LB52X_REQ_ATIM1_CC2       19
+#define SF32LB52X_REQ_ATIM1_CC3       20
+#define SF32LB52X_REQ_ATIM1_CC4       21
+#define SF32LB52X_REQ_PWMA1_UPDATE    SF32LB52X_REQ_ATIM1_UPDATE
+#define SF32LB52X_REQ_PWMA1_TRIGGER   SF32LB52X_REQ_ATIM1_TRIGGER
+#define SF32LB52X_REQ_PWMA1_CC1       SF32LB52X_REQ_ATIM1_CC1
+#define SF32LB52X_REQ_PWMA1_CC2       SF32LB52X_REQ_ATIM1_CC2
+#define SF32LB52X_REQ_PWMA1_CC3       SF32LB52X_REQ_ATIM1_CC3
+#define SF32LB52X_REQ_PWMA1_CC4       SF32LB52X_REQ_ATIM1_CC4
+#define SF32LB52X_REQ_I2C1            22
+#define SF32LB52X_REQ_I2C2            23
+#define SF32LB52X_REQ_I2C3            24
+#define SF32LB52X_REQ_ATIM1_COM       25
+#define SF32LB52X_REQ_USART3_TX       26
+#define SF32LB52X_REQ_USART3_RX       27
+#define SF32LB52X_REQ_SPI1_TX         28
+#define SF32LB52X_REQ_SPI1_RX         29
+#define SF32LB52X_REQ_SPI2_TX         30
+#define SF32LB52X_REQ_SPI2_RX         31
+#define SF32LB52X_REQ_I2S_TX          32
+#define SF32LB52X_REQ_I2S_RX          33
+#define SF32LB52X_REQ_PDM1_L          36
+#define SF32LB52X_REQ_PDM1_R          37
+#define SF32LB52X_REQ_GPADC           38
+#define SF32LB52X_REQ_AUDCODEC_ADC0   39
+#define SF32LB52X_REQ_AUDCODEC_ADC1   40
+#define SF32LB52X_REQ_AUDCODEC_DAC0   41
+#define SF32LB52X_REQ_AUDCODEC_DAC1   42
+#define SF32LB52X_REQ_GPTIM2_UPDATE   43
+#define SF32LB52X_REQ_GPTIM2_TRIGGER  44
+#define SF32LB52X_REQ_GPTIM2_CC1      45
+#define SF32LB52X_REQ_PWMT2_UPDATE    SF32LB52X_REQ_GPTIM2_UPDATE
+#define SF32LB52X_REQ_PWMT2_TRIGGER   SF32LB52X_REQ_GPTIM2_TRIGGER
+#define SF32LB52X_REQ_PWMT2_CC1       SF32LB52X_REQ_GPTIM2_CC1
+#define SF32LB52X_REQ_AUDPRC_TX_OUT1  46
+#define SF32LB52X_REQ_AUDPRC_TX_OUT0  47
+#define SF32LB52X_REQ_AUDPRC_TX3      48
+#define SF32LB52X_REQ_AUDPRC_TX2      49
+#define SF32LB52X_REQ_AUDPRC_TX1      50
+#define SF32LB52X_REQ_AUDPRC_TX0      51
+#define SF32LB52X_REQ_AUDPRC_RX1      52
+#define SF32LB52X_REQ_AUDPRC_RX0      53
+#define SF32LB52X_REQ_GPTIM2_CC2      54
+#define SF32LB52X_REQ_GPTIM2_CC3      55
+#define SF32LB52X_REQ_GPTIM2_CC4      56
+#define SF32LB52X_REQ_PWMT2_CC2       SF32LB52X_REQ_GPTIM2_CC2
+#define SF32LB52X_REQ_PWMT2_CC3       SF32LB52X_REQ_GPTIM2_CC3
+#define SF32LB52X_REQ_PWMT2_CC4       SF32LB52X_REQ_GPTIM2_CC4
+#define SF32LB52X_REQ_SDMMC1          57
+
+/* Served by DMAC2 (LPSYS). */
+#define SF32LB52X_REQ_USART4_TX       0
+#define SF32LB52X_REQ_USART4_RX       1
+#define SF32LB52X_REQ_USART5_TX       2
+#define SF32LB52X_REQ_USART5_RX       3
+#define SF32LB52X_REQ_BTIM3           6
+#define SF32LB52X_REQ_BTIM4           7
+
+typedef struct Sf32lb52xDma {
+    unsigned id;        /* SF32LB52X_DMA_1 or _2 */
+    uint64_t base;
+    unsigned irq;       /* interrupt number of channel 1 */
+} Sf32lb52xDma;
+
 typedef struct Sf32lb52xUsart {
     uint64_t base;
     unsigned irq;
+    /*
+     * The DMA request the receiver is wired to, and on which controller.
+     * From the board's dma_config.h; a USART with SF32LB52X_DMA_NONE has no
+     * request line and its dma_rx_req is not looked at.
+     */
+    unsigned dma_ctrl;
+    unsigned dma_rx_req;
 } Sf32lb52xUsart;
 
 extern const Sf32lb52xRegBank sf32lb52x_reg_banks[];
 extern const unsigned sf32lb52x_num_reg_banks;
+extern const Sf32lb52xDma sf32lb52x_dmas[];
+extern const unsigned sf32lb52x_num_dmas;
 extern const Sf32lb52xUsart sf32lb52x_usarts[];
 extern const unsigned sf32lb52x_num_usarts;
 
@@ -122,6 +241,13 @@ extern const unsigned sf32lb52x_num_usarts;
  * The set below is identical across 52x/56x/57x/58x; numbers that differ
  * per series are listed at the bottom and must be checked before use.
  */
+/*
+ * Each DMA controller interrupts on one line per channel, numbered
+ * consecutively from the first.
+ */
+#define SF32LB52X_IRQ_DMA_NUM       8
+#define SF32LB52X_IRQ_DMAC1_CH1     50
+#define SF32LB52X_IRQ_DMAC2_CH1     2
 #define SF32LB52X_IRQ_USART1        59
 #define SF32LB52X_IRQ_SPI1          60
 #define SF32LB52X_IRQ_I2C1          61
