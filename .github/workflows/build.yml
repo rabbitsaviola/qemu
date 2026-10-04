@@ -63,11 +63,15 @@ jobs:
         with:
           msystem: MINGW64
           update: true
-          # git is absent from this shell otherwise -- the runner's Git for
-          # Windows is not on MSYS2's PATH -- and meson fetches four wraps
-          # (dtc, keycodemapdb, berkeley-softfloat-3, berkeley-testfloat-3)
-          # with it while configuring.
+          # Neither git nor diff is on this shell's PATH: both are baseline on
+          # the Linux and macOS runners, but MSYS2 starts minimal, and the
+          # runner's Git for Windows is not visible from here either. meson
+          # needs git to fetch four wraps (dtc, keycodemapdb,
+          # berkeley-softfloat-3, berkeley-testfloat-3) while configuring, and
+          # diff unconditionally, for the QAPI schema tests. ca-certificates
+          # goes with git, for the HTTPS clones.
           install: >-
+            diffutils
             git
             ca-certificates
             mingw-w64-x86_64-gcc
