@@ -320,3 +320,83 @@ sed -n '1113,1122p' qom/object.c
 
 外设模型的详细设计（薄语义、就绪位伪造、表驱动、加新外设的步骤）见
 `peripherals.md`。
+
+---
+
+## 6. 分发的产物（CI）
+
+`.github/workflows/build.yml` 在 GitHub Actions 上为三个平台构建
+`qemu-system-arm` / `qemu-system-aarch64`，每个平台一个可下载的产物。
+`build-dist.sh` 负责构建和打包，`build-static-deps.sh` 提供 macOS 的静态库。
+
+### 6.1 运行要求
+
+**这是产物真正决定"能在哪儿跑"的东西**，和它打没打包库是两回事：
+
+| 平台 | 要求 | 由什么决定 |
+|---|---|---|
+| Linux | **glibc ≥ 2.35**<br>（Ubuntu 22.04+ / Debian 12+ / RHEL 9+）<br>另需 `libglib2.0-0`、`libpixman-1-0`、`libpng16-16`、`zlib1g` | CI 用 `ubuntu-22.04` runner——产物链的是 runner 的 glibc |
+| macOS | **macOS ≥ 11**，**仅 arm64** | `MACOSX_DEPLOYMENT_TARGET=11.0`；架构取决于 runner |
+| Windows | Windows 10+，x86_64 | MSYS2 mingw64 自身的下限 |
+
+**Linux 的下限跟着构建环境走，不是产物的属性。** CI 上编出来是 2.35；而在
+WSL（Ubuntu 24.04）用 `notes/build-sifli.sh` 本地编出来是 **glibc ≥ 2.38**，
+只能跑在 Ubuntu 23.10+ 上。要更宽的兼容性就用更老的构建环境——这正是 CI 选
+`ubuntu-22.04` 而不是 `-latest` 的唯一理由。
+
+**macOS 目前只有 arm64。** `macos-latest` 是 Apple silicon，产物在 Intel Mac 上
+跑不了（Rosetta 只能反方向：arm64 二进制不能在 Intel 上跑，反之可以）。要覆盖
+Intel 得再加一个 x86_64 的 job，而 GitHub 现在只有付费的 larger runner
+（`macos-latest-large`）提供 x86_64。
+
+### 6.2 三个平台为什么打包方式不同
+
+| 平台 | 打什么 | 为什么 |
+|---|---|---|
+| Linux | **不打** | 见 §6.3 |
+| macOS | 静态链接，不打 dylib | 否则二进制里是 `/opt/homebrew/opt/glib/lib/...` 这种绝对路径，机器上没有那个 Homebrew 就跑不起来 |
+| Windows | 打 MSYS2 的 DLL | 原装 Windows 上没有包管理器能拿到它们 |
+
+### 6.3 Linux 为什么不打库
+
+和 `pebble-qemu` 一致。把 `.so` 打进包看着更"自包含"，但：
+
+1. **它拿不掉 glibc 下限。** glibc 永远不能打进包，下限照样由构建环境决定。
+   产物会显得比实际更能跑——这是最坑的一点。
+2. **库版本被冻结，脱离发行版的安全更新。** `pcre2`、`zlib` 都有过 CVE。
+   系统包管理器升级了跟你无关，跑的是包里那份。
+
+代价只是要装两个包（`libglib2.0-0`、`libpixman-1-0`），几乎所有桌面发行版都有。
+
+构建脚本会把**依赖清单和 glibc 下限**都打出来——两者都是决定性的，而产物里
+都看不出来。清单是从二进制的 `NEEDED` 读的，不是手写的（手写的会漂）：
+
+```
+  no libraries bundled; the distribution provides these:
+    libglib-2.0.so.0 libpixman-1.so.0 libpng16.so.16 libz.so.1
+  and it needs GLIBC_2.35 or newer: the build host's version
+  decides that, and nothing in the artifact changes it.
+```
+
+（`libbz2`、`libzstd` 本来也在列表里，configure 里补了
+`--disable-bzip2 --disable-zstd --disable-lzo --disable-snappy` 之后没了。）
+
+### 6.4 一条容易上当的检查
+
+**"产物能跑起来"证明不了它打包正确。**
+
+构建机上装着同样的库，所以一个**完全没打成功**的包照样能跑——它只是去用系统
+那份了。"挪到别处跑一下"也挡不住，因为别处（同一台机器）也有。
+
+要验的是**引用**，不是**行为**：
+
+| 平台 | 检查 | 在哪 |
+|---|---|---|
+| macOS | `otool -L` 列出的路径里有没有非系统库 | `build-dist.sh` |
+| Windows | 每个从 `/mingw64` 解析的 DLL 在不在 exe 旁边 | `build-dist.sh` |
+
+两条不满足都直接 `exit 1`。
+
+（Linux 早先也打过库，当时同样需要这个检查——而且**正是它抓到了真 bug**：我按
+真实文件名拷贝，加载器按 SONAME 找，`libglib-2.0.so.0.8000.0` 和
+`libglib-2.0.so.0` 对不上，等于没打。当时"能跑"是假象。）

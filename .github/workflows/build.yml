@@ -1,0 +1,112 @@
+name: Build
+
+on:
+  push:
+    branches: [sifli-10.2]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 rather than -latest on purpose: the binaries link the
+          # runner's glibc, so the oldest runner that builds produces the one
+          # that runs on the most machines.
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            os: linux
+          - name: macos-arm64
+            runner: macos-latest
+            os: macos
+            # Without this, clang targets whatever macOS the runner happens to
+            # be and the floor moves whenever GitHub updates macos-latest.
+            # 11.0 is the oldest macOS that runs on Apple silicon.
+            deploy_target: "11.0"
+          - name: windows-x86_64
+            runner: windows-latest
+            os: windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ninja-build pkg-config python3-venv \
+            libglib2.0-dev libpixman-1-dev
+
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          # Build tools only: libraries are compiled statically from pinned
+          # sources by build-static-deps.sh.
+          brew install pkg-config ninja meson
+
+      - name: Cache static deps (macOS)
+        if: matrix.os == 'macos'
+        uses: actions/cache@v5
+        with:
+          path: build/static-deps
+          key: static-deps-${{ matrix.name }}-${{ hashFiles('build-static-deps.sh') }}
+
+      - name: Setup MSYS2 (Windows)
+        if: matrix.os == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pixman
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-python
+
+      - name: Build (Linux, macOS)
+        if: matrix.os != 'windows'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deploy_target }}
+        run: bash build-dist.sh
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: bash build-dist.sh
+
+      # Starting at all proves the artifact's own dependencies resolve -- the
+      # static link on macOS, the distribution's libraries on Linux. The
+      # machine check proves this build carries the SiFli machine, which is
+      # what the artifact is for. Neither says anything about whether bundled
+      # libraries were copied correctly; build-dist.sh asserts that separately,
+      # by inspecting references rather than by running anything.
+      - name: Smoke test (Linux, macOS)
+        if: matrix.os != 'windows'
+        run: |
+          ./dist/bin/qemu-system-arm --version
+          ./dist/bin/qemu-system-arm -M help | grep -q '^sf32lb52x'
+          ./dist/bin/qemu-system-aarch64 -M help | grep -q '^sf32lb52x'
+
+      - name: Smoke test (Windows)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: |
+          ./dist/bin/qemu-system-arm.exe --version
+          ./dist/bin/qemu-system-arm.exe -M help | grep -q '^sf32lb52x'
+          ./dist/bin/qemu-system-aarch64.exe -M help | grep -q '^sf32lb52x'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: qemu-sifli-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
