@@ -142,7 +142,12 @@ mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 "${SCRIPT_DIR}/configure" "${CONFIGURE_ARGS[@]}"
 
-JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+# $JOBS overrides the core count, so that a CI runner and a workstation can
+# pick different numbers. CPUs alone are the wrong answer on a machine whose
+# memory is the real limit: twelve parallel compiles plus the final link do not
+# fit in a small WSL VM, and nproc has no way to know that. (Set it on the
+# command line: JOBS=6 bash build-dist.sh.)
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 ninja -j"${JOBS}" qemu-system-arm qemu-system-aarch64
 
 echo
