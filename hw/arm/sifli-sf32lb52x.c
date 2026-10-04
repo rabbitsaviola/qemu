@@ -117,6 +117,8 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     Sifli52xMachineState *s = SIFLI_SF32LB52X_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     DeviceState *armv7m;
+    /* Indexed by SF32LB52X_DMA_*, so the USARTs can find their controller. */
+    DeviceState *dmas[SF32LB52X_DMA_2 + 1] = { NULL };
     unsigned i;
 
     /*
@@ -240,6 +242,9 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     /*
      * Both DMA controllers, with all eight channels of each.
      *
+     * The requests they serve are wired up by the peripherals below, not
+     * here: a controller only knows a request by its number, so it is the
+     * source, which knows which number it was given, that has to say so.
      * DMAC2 is built even though nothing on this board drives it from the
      * HCPU -- the firmware still probes it, and a peripheral it does not
      * find is a peripheral it may try to bring up differently.
@@ -258,12 +263,20 @@ static void sifli_sf32lb52x_init(MachineState *machine)
             sysbus_connect_irq(SYS_BUS_DEVICE(dev), c,
                                qdev_get_gpio_in(armv7m, d->irq + c));
         }
+
+        dmas[d->id] = dev;
     }
 
     /*
      * All five USARTs exist so that firmware probing them finds something.
      * Only the first is given a backend: it is the one a board wires to the
      * console, and the one "-serial" reaches through serial_hd(0).
+     *
+     * The receiver of each is wired to its DMA request, which is what a
+     * board's dma_config.h does on hardware. Nothing here depends on that
+     * request being served: a USART whose controller is absent simply never
+     * sees RDR read, which is also what happens when firmware leaves DMA
+     * receive switched off.
      */
     for (i = 0; i < sf32lb52x_num_usarts; i++) {
         const Sf32lb52xUsart *u = &sf32lb52x_usarts[i];
@@ -278,6 +291,13 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, u->base);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            qdev_get_gpio_in(armv7m, u->irq));
+
+        if (u->dma_ctrl != SF32LB52X_DMA_NONE) {
+            qdev_connect_gpio_out_named(dev, "dma-rx", 0,
+                                        qdev_get_gpio_in_named(
+                                            dmas[u->dma_ctrl], "request",
+                                            u->dma_rx_req));
+        }
     }
 
     /*

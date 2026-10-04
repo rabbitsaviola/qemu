@@ -14,6 +14,7 @@
 
 #include "chardev/char-fe.h"
 #include "hw/sysbus.h"
+#include "qemu/main-loop.h"
 #include "qom/object.h"
 
 #define TYPE_SIFLI_USART "sifli-usart"
@@ -54,6 +55,19 @@ struct SifliUsartState {
     MemoryRegion mmio;
     CharFrontend chr;
     qemu_irq irq;
+
+    /*
+     * The receiver's DMA request, held high while there is an unread
+     * character and the receiver is in DMA mode. The machine wires it to the
+     * request number the board gives this USART.
+     */
+    qemu_irq dma_rx;
+
+    /*
+     * Raises IDLE once the DMA has drained a burst; see
+     * sifli_usart_idle_bh().
+     */
+    QEMUBH *idle_bh;
 
     /*
      * Indexed by the enum above. USART_ISR holds only the sticky bits

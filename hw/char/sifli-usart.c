@@ -18,9 +18,12 @@
  *   - The receiver holds one byte. RXNE is raised when a character arrives
  *     and cleared by reading RDR; until then the chardev is asked to hold
  *     off, so no character is dropped and no overrun is reported.
- *   - BRR, GTPR, RTOR, CR2, CR3 and MISCR are stored and read back but have
- *     no effect. Baud rate, flow control and the sampling point do not
- *     change what a character looks like to the host.
+ *   - The DMA receive request mirrors RXNE while CR3.DMAR is set, and IDLE is
+ *     raised once a burst has been drained; see sifli_usart_update_dma_req()
+ *     and sifli_usart_idle_bh().
+ *   - BRR, GTPR, RTOR, CR2 and MISCR are stored and read back but have no
+ *     effect. Baud rate, flow control and the sampling point do not change
+ *     what a character looks like to the host.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -87,6 +90,9 @@
 #define USART_ICR_EOBCF     BIT(12)
 #define USART_ICR_CMCF      BIT(17)
 #define USART_ICR_WUCF      BIT(20)
+
+/* CR3 */
+#define USART_CR3_DMAR      BIT(6)
 
 /* RDR and TDR carry 9 data bits. */
 #define USART_DATA_MASK     0x1ff
@@ -191,6 +197,46 @@ static void sifli_usart_update_irq(SifliUsartState *s)
     qemu_set_irq(s->irq, level);
 }
 
+/*
+ * The DMA receive request.
+ *
+ * It mirrors the receiver's state instead of latching an edge, so a request
+ * raised while no channel was listening is still there to be found when one
+ * is pointed at it -- which is what happens when the console is reopened and
+ * a character lands before the HAL has set the channel up.
+ */
+static void sifli_usart_update_dma_req(SifliUsartState *s)
+{
+    bool rx = (s->regs[USART_ISR] & USART_ISR_RXNE) &&
+              (s->regs[USART_CR3] & USART_CR3_DMAR);
+
+    qemu_set_irq(s->dma_rx, rx);
+}
+
+/*
+ * IDLE, meaning "the DMA has drained this burst".
+ *
+ * On hardware this is the line sitting quiet for a character time after the
+ * last character. Here it is raised when that character is taken out of RDR
+ * and nothing follows it, which is the condition the SDK's uart_isr acts on:
+ * it reads the DMA channel's remaining count to work out how much arrived.
+ * Reaching it needs no baud rate, and this model has none to offer.
+ *
+ * The work is deferred to a bottom half rather than done in the read path so
+ * that it lands after the DMA transfer has finished. The vCPU runs in
+ * parallel with the thread that got here, so a guest woken immediately could
+ * read CNDTR before the transfer which emptied RDR had decremented it, and
+ * conclude that one character less than really arrived had turned up. Every
+ * burst would then come out one character short.
+ */
+static void sifli_usart_idle_bh(void *opaque)
+{
+    SifliUsartState *s = opaque;
+
+    s->regs[USART_ISR] |= USART_ISR_IDLE;
+    sifli_usart_update_irq(s);
+}
+
 static int sifli_usart_can_receive(void *opaque)
 {
     SifliUsartState *s = opaque;
@@ -213,6 +259,7 @@ static void sifli_usart_receive(void *opaque, const uint8_t *buf, int size)
 
     s->regs[USART_RDR] = buf[0];
     s->regs[USART_ISR] |= USART_ISR_RXNE;
+    sifli_usart_update_dma_req(s);
     sifli_usart_update_irq(s);
 }
 
@@ -232,6 +279,18 @@ static uint32_t sifli_usart_read_reg(SifliUsartState *s, unsigned idx)
         s->regs[USART_ISR] &= ~USART_ISR_RXNE;
         s->regs[USART_RDR] = 0;
         qemu_chr_fe_accept_input(&s->chr);
+
+        /*
+         * Nothing followed this character, so the burst is over. Only of
+         * interest in DMA mode: the IDLE interrupt is how the DMA receive
+         * path learns a burst ended, and a receiver being polled a character
+         * at a time has no use for it.
+         */
+        if (!(s->regs[USART_ISR] & USART_ISR_RXNE) &&
+            (s->regs[USART_CR3] & USART_CR3_DMAR)) {
+            qemu_bh_schedule(s->idle_bh);
+        }
+        sifli_usart_update_dma_req(s);
         sifli_usart_update_irq(s);
         return data;
     }
@@ -276,6 +335,12 @@ static void sifli_usart_write_reg(SifliUsartState *s, unsigned idx,
         s->regs[idx] = (s->regs[idx] & ~field) | (v & field);
         if (idx == USART_CR1) {
             sifli_usart_update_irq(s);
+        } else if (idx == USART_CR3) {
+            /*
+             * Switching the receiver into or out of DMA mode moves the
+             * request line, which can set a waiting channel going.
+             */
+            sifli_usart_update_dma_req(s);
         }
         return;
     }
@@ -333,6 +398,9 @@ static void sifli_usart_reset(DeviceState *dev)
      * it before the first byte does not wait forever.
      */
     s->regs[USART_ISR] = USART_ISR_TC;
+
+    qemu_bh_cancel(s->idle_bh);
+    qemu_set_irq(s->dma_rx, 0);
     sifli_usart_update_irq(s);
 }
 
@@ -345,6 +413,14 @@ static void sifli_usart_init(Object *obj)
     SifliUsartState *s = SIFLI_USART(obj);
 
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->dma_rx, "dma-rx", 1);
+    /*
+     * Guarded, as all bottom halves in hw/ are: it is scheduled from the
+     * RDR read path, which is this device's own MMIO handling.
+     */
+    s->idle_bh = aio_bh_new_guarded(qemu_get_aio_context(),
+                                    sifli_usart_idle_bh, s,
+                                    &DEVICE(obj)->mem_reentrancy_guard);
 
     memory_region_init_io(&s->mmio, obj, &sifli_usart_ops, s,
                           TYPE_SIFLI_USART, SIFLI_USART_MMIO_SIZE);
