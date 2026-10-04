@@ -13,7 +13,7 @@
  *     property rather than a constant.
  *   - RAM at 0x20000000.
  *   - Cortex-M33 with FPU (the firmware is built hard-float).
- *   - SysTick at 1 ms, SystemCoreClock = 20 MHz.
+ *   - SysTick at 1 ms, SystemCoreClock = 48 MHz (HXT48).
  *
  * Initialisation order follows hw/arm/mps2.c:
  *   clock_new -> qdev_prop_set_* -> qdev_connect_clock_in
@@ -32,16 +32,12 @@
 #include "hw/arm/armv7m.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/sf32lb52x.h"
+#include "hw/char/sifli-usart.h"
+#include "hw/misc/armv7m_dwt.h"
+#include "hw/misc/sifli-regbank.h"
 #include "system/system.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
-
-/*
- * SysTick source clock. Must match SystemCoreClock in the firmware's
- * system_qemu.c, otherwise the tick rate is wrong (the firmware computes
- * SysTick_Config(SystemCoreClock / 1000)).
- */
-#define SF32LB52X_SYSCLK_FRQ    20000000ULL
 
 #define TYPE_SIFLI_SF32LB52X_MACHINE MACHINE_TYPE_NAME("sf32lb52x")
 
@@ -120,10 +116,14 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     Sifli52xMachineState *s = SIFLI_SF32LB52X_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     DeviceState *armv7m;
+    unsigned i;
 
-    /* Clocks */
+    /*
+     * Clocks. The rate has to agree with what the RCC model makes the
+     * firmware believe: see SF32LB52X_HXT48_FRQ.
+     */
     s->sysclk = clock_new(OBJECT(machine), "SYSCLK");
-    clock_set_hz(s->sysclk, SF32LB52X_SYSCLK_FRQ);
+    clock_set_hz(s->sysclk, SF32LB52X_HXT48_FRQ);
 
     /*
      * Memory.
@@ -178,17 +178,89 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), &error_fatal);
 
     /*
+     * The DWT cycle counter.
+     *
+     * QEMU's M-profile CPU implements no DWT: the whole trace page at
+     * 0xe0000000 is covered by armv7m's "nvic-default" region, which
+     * swallows the access and reads back zero. The firmware's HAL_Delay_us_()
+     * spins on DWT_CYCCNT, so a counter that never moves turns every delay
+     * into an infinite loop -- and the board's HAL_PreInit calls it before
+     * anything can be printed.
+     *
+     * It has to go into the armv7m container rather than into this board's
+     * system memory. armv7m layers nvic-default over the whole PPB at the
+     * same priority it gives board memory, and
+     * memory_region_update_container_subregions() inserts a new subregion
+     * *before* an existing one of equal priority -- so nvic-default, added
+     * second, renders first and claims 0xe0001000. Anything inside board
+     * memory only ever gets the gaps, which is why mapping it there left
+     * DWT_CTRL reading back zero.
+     *
+     * Adding it here at priority 0 puts it ahead of nvic-default's -1.
+     */
+    {
+        DeviceState *dwt = qdev_new(TYPE_ARMV7M_DWT);
+
+        qdev_connect_clock_in(dwt, "clk", s->sysclk);
+        object_property_add_child(OBJECT(machine), "dwt", OBJECT(dwt));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dwt), &error_fatal);
+        memory_region_add_subregion_overlap(&s->armv7m.container,
+                                            ARMV7M_DWT_BASE,
+                                            sysbus_mmio_get_region(
+                                                SYS_BUS_DEVICE(dwt), 0),
+                                            0);
+    }
+
+    /*
      * Peripherals.
      *
-     * Phase 2 adds each one here with sysbus_realize + sysbus_mmio_map +
-     * sysbus_connect_irq(..., qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_xxx)).
-     *
-     * The firmware currently prints through semihosting and does not touch
-     * any peripheral register, so this is empty for now. To find out which
-     * unimplemented addresses the firmware touches, temporarily add
-     * create_unimplemented_device("sifli.usart1",
-     *                             SF32LB52X_USART1_BASE, 0x400);
-     * (needs #include "hw/misc/unimp.h").
+     * The configuration blocks -- RCC, AON, PMUC -- carry no behaviour, so
+     * they are table-driven: one sifli-regbank device per block, told which
+     * table to use and where to live. The tables are in sf32lb52x-periph.c.
+     */
+    for (i = 0; i < sf32lb52x_num_reg_banks; i++) {
+        const Sf32lb52xRegBank *b = &sf32lb52x_reg_banks[i];
+        DeviceState *dev = qdev_new(TYPE_SIFLI_REGBANK);
+
+        qdev_prop_set_string(dev, "bank", b->bank);
+
+        /*
+         * Every bank is offered the system clock; only the RCC has a hook
+         * that drives it, retuning SysTick as the firmware walks the clock
+         * tree. The others ignore it.
+         */
+        sifli_regbank_set_clock(SIFLI_REGBANK(dev), s->sysclk);
+
+        object_property_add_child(OBJECT(machine), b->bank, OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, b->base);
+    }
+
+    /*
+     * All five USARTs exist so that firmware probing them finds something.
+     * Only the first is given a backend: it is the one a board wires to the
+     * console, and the one "-serial" reaches through serial_hd(0).
+     */
+    for (i = 0; i < sf32lb52x_num_usarts; i++) {
+        const Sf32lb52xUsart *u = &sf32lb52x_usarts[i];
+        g_autofree char *name = g_strdup_printf("usart%u", i + 1);
+        DeviceState *dev = qdev_new(TYPE_SIFLI_USART);
+
+        if (i == 0) {
+            qdev_prop_set_chr(dev, "chardev", serial_hd(0));
+        }
+        object_property_add_child(OBJECT(machine), name, OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, u->base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           qdev_get_gpio_in(armv7m, u->irq));
+    }
+
+    /*
+     * Anything the firmware touches beyond this reads back as zero, because
+     * mc->ignore_memory_transaction_failures is set. To find out what is
+     * still missing, add create_unimplemented_device("sifli.<name>", base,
+     * size) (needs hw/misc/unimp.h) and run with -d guest_errors.
      */
 
     /*

@@ -40,6 +40,19 @@
  */
 #define SF32LB52X_FLASH_SIZE        (32 * MiB)
 
+/*
+ * The clock the firmware runs at, and therefore the one the machine must
+ * clock SysTick from.
+ *
+ * This is not free to choose: HAL_RCC_GetSysCLKFreq() computes the frequency
+ * the firmware believes in from the RCC registers, and the RCC table in
+ * hw/arm/sf32lb52x-periph.c is set up so that it returns 48 MHz (the board's
+ * HXT48 crystal) without consulting the PLL. If the SysTick clock here and
+ * that register state ever disagree, the firmware's 1 ms tick is wrong by the
+ * ratio.
+ */
+#define SF32LB52X_HXT48_FRQ         48000000ULL
+
 /* On-chip RAM: HPSYS RAM0 (128K, also DTCM) + RAM1 (128K) + RAM2 (256K) */
 #define SF32LB52X_SRAM_BASE         0x20000000ULL
 #define SF32LB52X_SRAM_SIZE         (512 * KiB)
@@ -57,6 +70,8 @@
 #define SF32LB52X_USART1_BASE       0x50084000ULL
 #define SF32LB52X_USART2_BASE       0x50085000ULL
 #define SF32LB52X_USART3_BASE       0x50086000ULL
+#define SF32LB52X_USART4_BASE       0x40005000ULL
+#define SF32LB52X_USART5_BASE       0x40006000ULL
 #define SF32LB52X_GPTIM1_BASE       0x50090000ULL
 #define SF32LB52X_GPTIM2_BASE       0x500b0000ULL
 #define SF32LB52X_BTIM1_BASE        0x50092000ULL
@@ -69,6 +84,37 @@
 #define SF32LB52X_MPI1_BASE         0x50041000ULL
 #define SF32LB52X_MPI2_BASE         0x50042000ULL
 #define SF32LB52X_HPSYS_RCC_BASE    0x50000000ULL
+#define SF32LB52X_LPSYS_RCC_BASE    0x40000000ULL
+#define SF32LB52X_HPSYS_CFG_BASE    0x5000b000ULL
+#define SF32LB52X_HPSYS_AON_BASE    0x500c0000ULL
+#define SF32LB52X_LPSYS_AON_BASE    0x40040000ULL
+#define SF32LB52X_PMUC_BASE         0x500ca000ULL
+#define SF32LB52X_RTC_BASE          0x500cb000ULL
+#define SF32LB52X_AUDPRC_BASE       0x50005000ULL
+#define SF32LB52X_AUDCODEC_BASE     0x50088000ULL
+
+/*
+ * The USARTs are split across the two buses: 1-3 sit in HPSYS, 4 and 5 in
+ * LPSYS. Their interrupt numbers are not contiguous either.
+ */
+#define SF32LB52X_IRQ_USART4        12
+#define SF32LB52X_IRQ_USART5        13
+
+/* Descriptions of the peripherals the machine instantiates. */
+typedef struct Sf32lb52xRegBank {
+    const char *bank;   /* name of the sifli-regbank table to instantiate */
+    uint64_t base;
+} Sf32lb52xRegBank;
+
+typedef struct Sf32lb52xUsart {
+    uint64_t base;
+    unsigned irq;
+} Sf32lb52xUsart;
+
+extern const Sf32lb52xRegBank sf32lb52x_reg_banks[];
+extern const unsigned sf32lb52x_num_reg_banks;
+extern const Sf32lb52xUsart sf32lb52x_usarts[];
+extern const unsigned sf32lb52x_num_usarts;
 
 /*
  * External interrupt numbers (IRQn_Type, HCPU side).
