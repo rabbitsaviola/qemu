@@ -351,13 +351,14 @@ aarch64 那个二进制对这个项目没有用处——虽然它也能跑这块
 
 | 平台 | 要求 | 由什么决定 |
 |---|---|---|
-| Linux | **glibc ≥ 2.35**<br>（Ubuntu 22.04+ / Debian 12+ / RHEL 9+）<br>另需 `libglib2.0-0`、`libpixman-1-0`、`libpng16-16`、`zlib1g` | CI 用 `ubuntu-22.04` runner——产物链的是 runner 的 glibc |
+| Linux | **glibc ≥ 2.34**<br>（Ubuntu 21.10+ / Debian 12+ / RHEL 9+）<br>另需 `libglib2.0-0`、`libpixman-1-0`、`libpng16-16`、`zlib1g` | CI 用 `ubuntu-22.04` runner——产物链的是 runner 的 glibc |
 | macOS | **macOS ≥ 11**，**仅 arm64** | `MACOSX_DEPLOYMENT_TARGET=11.0`；架构取决于 runner |
 | Windows | Windows 10+，x86_64 | MSYS2 mingw64 自身的下限 |
 
-**Linux 的下限跟着构建环境走，不是产物的属性。** CI 上编出来是 2.35；而在
-WSL（Ubuntu 24.04）用 `notes/build-sifli.sh` 本地编出来是 **glibc ≥ 2.38**，
-只能跑在 Ubuntu 23.10+ 上。要更宽的兼容性就用更老的构建环境——这正是 CI 选
+**Linux 的下限跟着构建环境走，不是产物的属性。** CI 上编出来是 2.34——这个数
+是从产物读出来的，不是 runner 的版本（runner 是 22.04、glibc 2.35，产物实际
+只用到 2.34 的符号）。而在 WSL（Ubuntu 24.04）用 `notes/build-sifli.sh` 本地
+编出来是 **glibc ≥ 2.38**，只能跑在 Ubuntu 23.10+ 上。要更宽的兼容性就用更老的构建环境——这正是 CI 选
 `ubuntu-22.04` 而不是 `-latest` 的唯一理由。
 
 **macOS 目前只有 arm64。** `macos-latest` 是 Apple silicon，产物在 Intel Mac 上
@@ -390,7 +391,7 @@ Intel 得再加一个 x86_64 的 job，而 GitHub 现在只有付费的 larger r
 ```
   no libraries bundled; the distribution provides these:
     libglib-2.0.so.0 libpixman-1.so.0 libpng16.so.16 libz.so.1
-  and it needs GLIBC_2.35 or newer: the build host's version
+  and it needs GLIBC_2.34 or newer: the build host's version
   decides that, and nothing in the artifact changes it.
 ```
 
