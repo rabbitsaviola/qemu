@@ -63,7 +63,13 @@ jobs:
         with:
           msystem: MINGW64
           update: true
+          # git is absent from this shell otherwise -- the runner's Git for
+          # Windows is not on MSYS2's PATH -- and meson fetches four wraps
+          # (dtc, keycodemapdb, berkeley-softfloat-3, berkeley-testfloat-3)
+          # with it while configuring.
           install: >-
+            git
+            ca-certificates
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-glib2
             mingw-w64-x86_64-meson

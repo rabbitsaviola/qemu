@@ -100,6 +100,13 @@ CONFIGURE_ARGS=(
     --disable-seccomp
     --disable-tpm
     --disable-install-blobs
+
+    # crypto. Pinning PKG_CONFIG_LIBDIR hides Homebrew's pkg-config tree but
+    # not the config-tool lookup meson also tries for libgcrypt, so on macOS
+    # the link picked up /opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib --
+    # a library build-static-deps.sh does not build. QEMU's built-in crypto
+    # covers what an emulator needs.
+    --disable-gcrypt
 )
 
 # Linux-only options; passing them elsewhere would be rejected outright.
