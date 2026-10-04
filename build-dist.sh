@@ -1,6 +1,10 @@
 #!/bin/bash
-# Build qemu-system-arm and qemu-system-aarch64 from this tree and bundle a
-# relocatable distribution under ./dist.
+# Build qemu-system-arm from this tree and bundle a relocatable distribution
+# under ./dist.
+#
+# Only the 32-bit target is built. The SF32LB52x is a Cortex-M33, an ARMv8-M
+# part, so qemu-system-aarch64 has nothing to offer this project -- building it
+# too would double the build and the download for a binary no one here can use.
 #
 # What each bundle carries:
 #
@@ -56,7 +60,7 @@ fi
 # block layer, no accelerators but TCG. Every dependency switched off here is
 # one fewer library to bundle below.
 CONFIGURE_ARGS=(
-    --target-list=arm-softmmu,aarch64-softmmu
+    --target-list=arm-softmmu
     --python="${PYTHON}"
     --disable-docs
     --disable-tools
@@ -154,19 +158,16 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 EXE=""
 [ "${PLATFORM}" = windows ] && EXE=".exe"
 
-ninja -j"${JOBS}" "qemu-system-arm${EXE}" "qemu-system-aarch64${EXE}"
+ninja -j"${JOBS}" "qemu-system-arm${EXE}"
 
 echo
 echo "=== Bundling distributable ==="
 rm -rf "${DIST_DIR}"
 mkdir -p "${DIST_DIR}/bin" "${DIST_DIR}/lib"
 
-for target in arm aarch64; do
-    cp "${BUILD_DIR}/qemu-system-${target}${EXE}" "${DIST_DIR}/bin/"
-    strip "${DIST_DIR}/bin/qemu-system-${target}${EXE}" 2>/dev/null || true
-done
-BINARIES=("${DIST_DIR}/bin/qemu-system-arm${EXE}"
-          "${DIST_DIR}/bin/qemu-system-aarch64${EXE}")
+cp "${BUILD_DIR}/qemu-system-arm${EXE}" "${DIST_DIR}/bin/"
+strip "${DIST_DIR}/bin/qemu-system-arm${EXE}" 2>/dev/null || true
+BINARIES=("${DIST_DIR}/bin/qemu-system-arm${EXE}")
 
 case "${PLATFORM}" in
 linux)

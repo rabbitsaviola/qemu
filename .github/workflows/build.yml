@@ -104,7 +104,6 @@ jobs:
         run: |
           ./dist/bin/qemu-system-arm --version
           ./dist/bin/qemu-system-arm -M help | grep -q '^sf32lb52x'
-          ./dist/bin/qemu-system-aarch64 -M help | grep -q '^sf32lb52x'
 
       - name: Smoke test (Windows)
         if: matrix.os == 'windows'
@@ -112,7 +111,6 @@ jobs:
         run: |
           ./dist/bin/qemu-system-arm.exe --version
           ./dist/bin/qemu-system-arm.exe -M help | grep -q '^sf32lb52x'
-          ./dist/bin/qemu-system-aarch64.exe -M help | grep -q '^sf32lb52x'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

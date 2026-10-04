@@ -338,8 +338,12 @@ sed -n '1113,1122p' qom/object.c
 ## 6. 分发的产物（CI）
 
 `.github/workflows/build.yml` 在 GitHub Actions 上为三个平台构建
-`qemu-system-arm` / `qemu-system-aarch64`，每个平台一个可下载的产物。
+`qemu-system-arm`，每个平台一个可下载的产物。
 `build-dist.sh` 负责构建和打包，`build-static-deps.sh` 提供 macOS 的静态库。
+
+产物里**只有 32 位的 `qemu-system-arm`**。SF32LB52x 是 Cortex-M33（ARMv8-M），
+aarch64 那个二进制对这个项目没有用处——虽然它也能跑这块板子，但为主力用途编
+一份用不上的二进制，只是让构建时间和下载体积都翻倍。
 
 ### 6.1 运行要求
 
