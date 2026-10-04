@@ -205,8 +205,9 @@ linux)
     rmdir "${DIST_DIR}/lib"
     echo "  no libraries bundled; the distribution provides these:"
     echo "    ${deps}"
-    echo "  and it needs ${floor:-glibc} or newer: the build host's version"
-    echo "  decides that, and nothing in the artifact changes it."
+    echo "  and it needs ${floor:-glibc} or newer. That number is read off the"
+    echo "  binary, not taken from the build host: building on a newer system can"
+    echo "  only raise it, and an older glibc cannot run a newer one's binary."
     ;;
 macos)
     # Nothing to bundle: build-static-deps.sh linked everything statically.

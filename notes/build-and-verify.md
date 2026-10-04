@@ -362,15 +362,32 @@ aarch64 那个二进制对这个项目没有用处——虽然它也能跑这块
 
 | 平台 | 要求 | 由什么决定 |
 |---|---|---|
-| Linux | **glibc ≥ 2.34**<br>（Ubuntu 21.10+ / Debian 12+ / RHEL 9+）<br>另需 `libglib2.0-0`、`libpixman-1-0`、`libpng16-16`、`zlib1g` | CI 用 `ubuntu-22.04` runner——产物链的是 runner 的 glibc |
+| Linux | **glibc ≥ 2.34**<br>（Ubuntu 21.10+ / Debian 12+ / RHEL 9+）<br>另需 `libglib2.0-0`、`libpixman-1-0`、`libpng16-16`、`zlib1g` | 产物里引用到的最高 `GLIBC_x.y` 符号（不是构建环境的版本）|
 | macOS | **macOS ≥ 11**，**仅 arm64** | `MACOSX_DEPLOYMENT_TARGET=11.0`；架构取决于 runner |
 | Windows | Windows 10+，x86_64 | MSYS2 mingw64 自身的下限 |
 
-**Linux 的下限跟着构建环境走，不是产物的属性。** CI 上编出来是 2.34——这个数
-是从产物读出来的，不是 runner 的版本（runner 是 22.04、glibc 2.35，产物实际
-只用到 2.34 的符号）。而在 WSL（Ubuntu 24.04）用 `notes/build-sifli.sh` 本地
-编出来是 **glibc ≥ 2.38**，只能跑在 Ubuntu 23.10+ 上。要更宽的兼容性就用更老的构建环境——这正是 CI 选
-`ubuntu-22.04` 而不是 `-latest` 的唯一理由。
+**Linux 的下限要读产物，不能拿构建环境的 glibc 顶替。**
+
+glibc 的函数带版本号（`memcpy@GLIBC_2.14`）。链接时二进制记下**用到的最高
+版本**，运行时动态链接器检查系统里有没有——没有就直接起不来：
+
+```
+version `GLIBC_2.38' not found
+```
+
+所以产物能跑的**最低** glibc 版本，就是它引用到的最高 `GLIBC_x.y`：
+
+```bash
+objdump -T <二进制> | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1
+```
+
+这个值**不可能超过构建环境的 glibc**（编不出系统里没有的符号），但通常低于它：
+CI 的 runner 是 22.04（glibc 2.35），而产物实际只用到 **2.34**。
+
+**在越新的系统上编，这个值只会越高，产物能跑的机器就越少。** 用 Ubuntu 24.04
+（glibc 2.39）编出来是 2.38，只能跑在 23.10+ 上。反过来永远成立：glibc 向后
+兼容，新系统能跑旧产物。CI 选 `ubuntu-22.04` 而不是 `-latest`，就是为了让产物
+跑在**更多**机器上——这是它唯一的理由。
 
 **macOS 目前只有 arm64。** `macos-latest` 是 Apple silicon，产物在 Intel Mac 上
 跑不了（Rosetta 只能反方向：arm64 二进制不能在 Intel 上跑，反之可以）。要覆盖
