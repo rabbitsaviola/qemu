@@ -5,6 +5,15 @@
 
 **所有操作都在 WSL 里做**——Windows 侧没有 gcc/meson，编不了。
 
+`notes/` 下的东西：
+
+| 文件 | 用途 |
+|---|---|
+| `build-sifli.sh` | 构建（`notes/build-and-verify.md` 就是本文） |
+| `verify-sifli.sh` | 一条命令跑完八项检查，退出码可直接进 CI |
+| `qtest-sifli.sh` | 单独验外设写路径，被 verify 的第 8 项调用 |
+| `peripherals.md` | 外设模型是怎么设计的、怎么加新的 |
+
 ---
 
 ## 0. 两个环境前提
@@ -36,12 +45,12 @@ venv 是免 sudo 的绕法。构建脚本里已经 `export PATH` 了。
 ## 1. 构建
 
 ```bash
-bash ~/code/build-sifli.sh
+bash notes/build-sifli.sh
 ```
 
 脚本做的事：
 1. 补齐 wrap 子项目（见 §4 坑 ③）
-2. `configure --target-list=arm-softmmu,aarch64-softmmu ...`
+2. `configure --target-list=arm-softmmu,aarch64-softmmu ...`（已配置过会跳过）
 3. `ninja -j6`（见 §4 坑 ⑤）
 
 产物在 `~/build-sifli/`：
@@ -166,12 +175,41 @@ git log -1 --format=%B | grep -E "^(Signed-off-by|Co-Authored-By)"
 
 ---
 
-## 3. 快速自查清单
+## 3. 一条命令跑完
+
+上面每一项都是 `notes/verify-sifli.sh` 里的一个检查项：
+
+```bash
+bash notes/verify-sifli.sh            # 固件默认用 qemu-support 的 hello_qemu
+bash notes/verify-sifli.sh fw.elf     # 换个固件
+bash notes/verify-sifli.sh -          # 跳过固件那一项
+```
+
+九项检查，全部通过退出码 0，可直接进 CI：
+
+| # | 检查 | 性质 |
+|---|---|---|
+| 1 | 两个二进制都编出来了 | |
+| 2 | 两个二进制里 `-M help` 都能看到 sf32lb52x | |
+| 3 | checkpatch 0 errors 0 warnings | |
+| 4 | 工作区行尾是 LF（不是 CRLF） | |
+| 5 | `hello_qemu` 能跑出 banner | 冒烟（走 semihosting，不碰 HAL）|
+| 6 | 提交带 Signed-off-by 且与 author 一致 | |
+| 7 | 外设区域都映射了，寄存器读回值正确 | 结构性 |
+| 8 | 外设写路径（qtest） | 结构性 |
+| **9** | **真实板子固件跑到 `main()` 和 msh 提示符** | **真正的验收** |
+
+**第 9 项才是关键。** 第 5 项的 `hello_qemu` 走 semihosting 桩，一个 HAL 寄存器
+都不碰；第 7、8 项只是读几个寄存器。只有 SDK 原样构建的真实板子固件、一行不改
+地跑到 `main()`，才能证明整个 HAL 真的在模型上跑起来了——时钟树、电源、RTC、
+MPI、音频、控制台，整条链路。详见 `peripherals.md`。
+
+不跑脚本时手工至少查这几条：
 
 ```
 □ 两个二进制的 -M help 都能看到 sf32lb52x
 □ 固件能跑出 "Hello SiFli on QEMU!"
-□ checkpatch 两个新文件 0 errors 0 warnings
+□ checkpatch 0 errors 0 warnings
 □ git ls-files --eol 显示 w/lf（不是 w/crlf）
 □ git diff --stat 只有自己的改动
 □ 提交带 Signed-off-by 且与 author 一致
@@ -260,7 +298,25 @@ memory=16GB
 （上次就是靠打出的指针地址，发现崩溃对象恰好是 machine 自己，从而定位到
 `memory_region_init_rom()` 会对 owner 做 `DEVICE()`）。
 
+**不开固件就读写外设寄存器**：用 qtest。它的 `writel`/`readl` 走
+`address_space_write/read`，和外设 MMIO 是同一条路，而且在机器建好、复位完成
+之后：
+
+```bash
+printf 'readl 0x5000001c\nwritel 0x50000010 0x10\nreadl 0x50000008\nquit\n' \
+  | ./qemu-system-arm -M sf32lb52x -display none -serial none -qtest stdio 2>/dev/null
+```
+
+返回值是 64 位十六进制。**别合并 stderr**——那里有 `[R ...]`/`[S ...]` 的 trace，
+会打乱取值顺序。
+
+`-device loader,addr=...,data=...,data-len=4` 也能写物理地址，但它在设备 reset
+**之前**执行，写进寄存器会被复位冲掉（写 SRAM 不受影响）。所以测寄存器要用 qtest。
+
 **确认接口过滤逻辑**：
 ```bash
 sed -n '1113,1122p' qom/object.c
 ```
+
+外设模型的详细设计（薄语义、就绪位伪造、表驱动、加新外设的步骤）见
+`peripherals.md`。

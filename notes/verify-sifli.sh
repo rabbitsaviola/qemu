@@ -55,8 +55,16 @@ echo
 
 # ------------------------------------------------------- 3. 格式（checkpatch）
 echo "[3] 代码格式"
+NEW_FILES="hw/arm/sifli-sf32lb52x.c
+include/hw/arm/sf32lb52x.h
+hw/arm/sf32lb52x-periph.c
+hw/char/sifli-usart.c
+include/hw/char/sifli-usart.h
+hw/misc/sifli-regbank.c
+include/hw/misc/sifli-regbank.h"
+
 if [ -f "$SRC/scripts/checkpatch.pl" ]; then
-    for f in hw/arm/sifli-sf32lb52x.c include/hw/arm/sf32lb52x.h; do
+    for f in $NEW_FILES; do
         [ -f "$SRC/$f" ] || { skip "$f 不存在"; continue; }
         out=$(cd "$SRC" && perl scripts/checkpatch.pl --no-tree --file "$f" 2>&1)
         # checkpatch 只在有 ERROR 时返回非零，所以要抓 summary 行
@@ -76,8 +84,10 @@ echo
 echo "[4] 工作区行尾（应为 LF）"
 if [ -d "$SRC/.git" ]; then
     bad=$(cd "$SRC" && git ls-files --eol \
-              hw/arm/sifli-sf32lb52x.c include/hw/arm/sf32lb52x.h \
-              hw/arm/Kconfig hw/arm/meson.build 2>/dev/null \
+              $NEW_FILES \
+              hw/arm/Kconfig hw/arm/meson.build \
+              hw/char/Kconfig hw/char/meson.build \
+              hw/misc/Kconfig hw/misc/meson.build 2>/dev/null \
           | grep 'w/crlf' || true)
     if [ -z "$bad" ]; then
         pass "新文件与改动的构建文件都是 LF"
@@ -127,6 +137,120 @@ if [ -d "$SRC/.git" ]; then
     fi
 else
     skip "不是 git 仓库"
+fi
+echo
+
+# --------------------------------------------------------------- 7. 外设模型
+# 表注册 / 设备创建 / 地址映射 / 强制位，这条链上任何一环断了，机器照样能启动，
+# 只是固件读到一片 0 然后卡在某个 while 里。所以直接从 monitor 读回寄存器。
+echo "[7] 外设模型（寄存器回读）"
+if [ ! -x "$BUILD/qemu-system-arm" ]; then
+    skip "二进制不存在"
+else
+    probe_in=$(cat <<'EOF'
+info mtree
+xp /1wx 0x40040040
+xp /1wx 0x50000020
+xp /1wx 0x5000002c
+xp /1wx 0x5000b004
+xp /1wx 0x5008401c
+xp /1wx 0x500c0010
+xp /1wx 0x500c002c
+xp /1wx 0x500ca01c
+xp /1wx 0x500ca020
+EOF
+)
+    probe=$(printf '%s\nquit\n' "$probe_in" \
+                | timeout 40 "$BUILD/qemu-system-arm" -M sf32lb52x \
+                      -display none -monitor stdio -serial none -S 2>&1 \
+                | tr -d '\r')
+
+    if [ -z "$probe" ]; then
+        fail "拿不到 monitor 输出"
+    else
+        for r in sf32lb52x.hpsys_rcc sf32lb52x.lpsys_rcc sf32lb52x.hpsys_cfg \
+                 sf32lb52x.hpsys_aon sf32lb52x.lpsys_aon sf32lb52x.pmuc; do
+            if echo "$probe" | grep -q "$r"; then
+                pass "$r 已映射"
+            else
+                fail "$r 不在 info mtree 里"
+            fi
+        done
+
+        # 地址 期望值 说明
+        while read -r addr want what; do
+            [ -n "$addr" ] || continue
+            got=$(echo "$probe" | grep -i "$addr:" | awk '{print $2}' \
+                      | tr 'A-F' 'a-f')
+            want=$(echo "$want" | tr 'A-F' 'a-f')
+            if [ "$got" = "$want" ]; then
+                pass "$what = $got"
+            else
+                fail "$what：期望 $want，实际 ${got:-<读不到>}"
+            fi
+        done <<'EOF'
+50000020 0x00000001 HPSYS_RCC.CSR 复位选 HXT48
+5000002c 0x80000000 HPSYS_RCC.DLL1CR READY 强制置位
+5000b004 0x00000707 HPSYS_CFG.IDR REVID=A4
+500c0010 0xc0000000 HPSYS_AON.ACR HXT48/HRC48 RDY
+500c002c 0x00000030 HPSYS_AON.ISSR HP+LP ACTIVE
+500ca01c 0x80000000 PMUC.LRC32_CR RDY
+500ca020 0x80000000 PMUC.LXT_CR RDY
+40040040 0x00000000 LPSYS_AON.SLP_CTRL SLEEP_STATUS 读 0
+5008401c 0x000000c0 USART1.ISR TXE|TC 恒置
+EOF
+    fi
+fi
+echo
+
+# --------------------------------------------------------- 8. 写路径（qtest）
+# 第 7 项只能读，写路径单独用 qtest 验。说明见 qtest-sifli.sh。
+echo "[8] 写路径（qtest）"
+if [ -f "$SRC/notes/qtest-sifli.sh" ]; then
+    if out=$(SIFLI_QEMU_BUILD="$BUILD" bash "$SRC/notes/qtest-sifli.sh" 2>&1); then
+        pass "RCC 使能别名（ESR/ECR→ENR）与普通寄存器读写"
+    else
+        fail "qtest 写路径验证失败："
+        echo "$out" | sed 's/^/         /'
+    fi
+else
+    skip "找不到 notes/qtest-sifli.sh"
+fi
+echo
+
+# ------------------------------------------------------- 9. 真实板子固件
+# 这一项才是真正的验收。
+#
+# 第 5 项那个 hello_qemu 走 semihosting 桩，一个 HAL 寄存器都不碰；第 7、8 项
+# 只是结构性地读几个寄存器。只有这里——SDK 原样构建的真实板子固件、一行不改
+# ——能证明整个 HAL 真的在模型上跑起来了：时钟树、电源、RTC、MPI、音频、
+# 控制台，一路到 main() 和 RT-Thread 的 shell。
+#
+# 固件用 scons 构建：
+#   cd <SDK>/example/get-started/hello_world/rtt/project
+#   scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+echo "[9] 真实板子固件（sf32lb52-lcd_a128r16 hello_world）"
+REAL_FW=${SIFLI_REAL_FW:-/mnt/e/code2/SiFli-SDK/example/get-started/hello_world/rtt/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf}
+if [ "$REAL_FW" = "-" ]; then
+    skip "按要求跳过"
+elif [ ! -f "$REAL_FW" ]; then
+    skip "固件不存在，先用 scons 构建：$REAL_FW"
+else
+    # 不带 -semihosting：固件必须走真实的 HAL UART 驱动，走我们的 USART 模型，
+    # 输出经 chardev 到 stdout。带了 -semihosting 就等于绕开了要验的东西。
+    # sed 去掉 RT-Thread 日志的 ANSI 颜色码（[32;22m...）。
+    out=$(timeout 60 "$BUILD/qemu-system-arm" -M sf32lb52x -nographic \
+              -kernel "$REAL_FW" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+
+    missing=""
+    echo "$out" | grep -q "Hello world" || missing="$missing main()输出"
+    echo "$out" | grep -q "msh />"      || missing="$missing msh提示符"
+    if [ -z "$missing" ]; then
+        pass "启动到 main()，停在 RT-Thread msh 提示符"
+    else
+        fail "没看到：$missing。最后几行："
+        echo "$out" | tail -6 | sed 's/^/         /'
+    fi
 fi
 echo
 
