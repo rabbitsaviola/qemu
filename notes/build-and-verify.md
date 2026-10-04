@@ -160,8 +160,8 @@ scons --board=sf32lb52-lcd_a128r16_hcpu -j8
 
 ```bash
 cd ~/code/sifli-qemu
-perl scripts/checkpatch.pl --no-tree --file hw/arm/sifli-sf32lb52x.c
-perl scripts/checkpatch.pl --no-tree --file include/hw/arm/sf32lb52x.h
+perl scripts/checkpatch.pl --no-tree --file $PWD/hw/arm/sifli-sf32lb52x.c
+perl scripts/checkpatch.pl --no-tree --file $PWD/include/hw/arm/sf32lb52x.h
 ```
 
 期望各自以这句收尾：
@@ -171,6 +171,21 @@ perl scripts/checkpatch.pl --no-tree --file include/hw/arm/sf32lb52x.h
 ```
 
 `--no-tree` 必须加——这棵树不是 kernel tree，不加会被 `top_of_kernel_tree` 挡下。
+
+**文件名要给绝对路径（或者任何带 `/hw/` 的路径）。** checkpatch 里有按 `$realfile`
+匹配的规则，比如
+
+```perl
+if ($realfile =~ /.*\/hw\/.*/ && $line =~ /\bqemu_bh_new(_guarded)?\s*\(/) {
+    ERROR("use aio_bh_new_guarded() instead of qemu_bh_new*() ...");
+}
+```
+
+相对路径 `hw/dma/sifli-dma.c` 里**没有** `/hw/` 这个子串（它以 `hw/` 开头，前面
+没有斜杠），规则不触发，报出来的是 0 errors——**假通过**。这一条真的漏过一次：
+两个新设备都用了 `qemu_bh_new()`，相对路径下一路全绿，换成 `$PWD/...` 才报出来。
+
+`verify-sifli.sh` 第 3 项已经改成传绝对路径了。
 
 **最常见的两条**：
 - `ERROR: New file '...' requires 'SPDX-License-Identifier'` —— 新 `.c`/`.h` 必须有 SPDX 头
@@ -223,7 +238,7 @@ SIFLI_REAL_FW=- bash notes/verify-sifli.sh       # 跳过固件那一项
 | **8** | **真实板子固件跑到 `main()` 和 msh 提示符** | **真正的验收** |
 
 **第 8 项才是关键。** 第 6、7 项只是读几个寄存器，**模型写错了它们照样能过**
-——`peripherals.md` §6.2 那个 DWT 映射错位的坑就骗过了它们全部。只有 SDK 原样
+——`peripherals.md` §7.2 那个 DWT 映射错位的坑就骗过了它们全部。只有 SDK 原样
 构建的真实板子固件、一行不改地跑到 `main()`，才能证明整个 HAL 真的在模型上跑
 起来了——时钟树、电源、RTC、MPI、音频、控制台，整条链路。
 

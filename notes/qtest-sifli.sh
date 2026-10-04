@@ -12,6 +12,10 @@
 #   （bf0_hal_rcc.c:1959 / :1998 / :2037）
 # 纯表表达不了这种跨寄存器关系，靠 write_hook 实现。
 #
+# DMA 那一段除了寄存器回读，还跑一次真的 memory-to-memory 搬运：DMA 的
+# 请求线是外设驱动的，qtest 里没有外设，只有 MEM2MEM 这种"置 EN 就跑"的
+# 通道能在没有请求的情况下证明 address_space 那两下真的搬了字节。
+#
 # 用法：bash notes/qtest-sifli.sh
 #
 # 环境变量可覆盖：
@@ -49,7 +53,33 @@ out=$(run \
     'readl 0x500c0024' \
     'writel 0x500c0028 0x0000000f' \
     'readl 0x500c0024' \
-    'readl 0x500c0028')
+    'readl 0x500c0028' \
+    \
+    'writel 0x500810ac 0x00050000' \
+    'readl 0x500810ac' \
+    'writel 0x500810a8 0x04000000' \
+    'readl 0x500810a8' \
+    \
+    'writel 0x5008100c 0x00000040' \
+    'readl 0x5008100c' \
+    'writel 0x50081010 0x50084024' \
+    'readl 0x50081010' \
+    'writel 0x50081014 0x20000100' \
+    'readl 0x50081014' \
+    \
+    'writel 0x20000000 0x04030201' \
+    'writel 0x50081010 0x20000000' \
+    'writel 0x50081014 0x20000010' \
+    'writel 0x5008100c 0x00000004' \
+    'writel 0x50081004 0xffffffff' \
+    'writel 0x50081008 0x000040c1' \
+    'readl 0x20000010' \
+    'readl 0x5008100c' \
+    'readl 0x50081010' \
+    'readl 0x50081014' \
+    'readl 0x50081000' \
+    'writel 0x50081004 0xffffffff' \
+    'readl 0x50081000')
 
 if [ -z "$out" ]; then
     echo "拿不到 qtest 输出"
@@ -92,6 +122,33 @@ echo "[3] 写 A 清 B：HPSYS_AON.WCR 清 WSR"
 check 0xffffffff "先直接写 WSR（它是普通存储）"
 check 0xfffffff0 "WCR 写 0xf 后，WSR 低 4 位被清"
 check 0x0        "WCR 自身只写，读回 0"
+
+echo
+echo "[4] DMA：CSELR 请求号字段布局"
+# C 字段 6 bit，通道 n 在 (n-1)%4 那个字节里（dmac.h DMAC_CSELR1_C1S_Pos）。
+# HAL_DMA_Init 就是按这个布局写的（bf0_hal_dma.c），写错了请求号就选不中
+# 通道，串口收字节会静默地没人搬。
+check 0x50000    "CSELR2 通道 7 写 5（bit23:16）"
+check 0x4000000  "CSELR1 通道 4 写 4（bit31:24）"
+
+echo
+echo "[5] DMA：通道寄存器"
+check 0x40       "CNDTR1 写 64"
+check 0x50084024 "CPAR1 写 USART1.RDR"
+check 0x20000100 "CM0AR1 写内存地址"
+
+echo
+echo "[6] DMA：一次真的搬运（MEM2MEM，置 EN 就跑）"
+# 源在 0x20000000，目的在 0x20000010，4 个字节，MINC|PINC。
+check 0x04030201 "目的内存拿到源内存的内容"
+check 0x0        "CNDTR1 减到 0"
+check 0x20000004 "CPAR1 按 PINC 前进 4（PSIZE=byte）"
+check 0x20000014 "CM0AR1 按 MINC 前进 4"
+# HTIF 在还剩 NDT/2 时置（SVD：half NDT are transferred）——4 字节的第 2 个
+# 字节搬完就置上了，所以是 7 不是 3。
+check 0x7        "ISR 置 GIF1|TCIF1|HTIF1"
+# CGIF 是整组的清位（SVD：各标志"write 1 to CTCIF or CGIF"清除）。
+check 0x0        "IFCR 写 CGIF 后 ISR 清零"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

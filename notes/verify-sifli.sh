@@ -59,13 +59,19 @@ include/hw/arm/sf32lb52x.h
 hw/arm/sf32lb52x-periph.c
 hw/char/sifli-usart.c
 include/hw/char/sifli-usart.h
+hw/dma/sifli-dma.c
+include/hw/dma/sifli-dma.h
 hw/misc/sifli-regbank.c
 include/hw/misc/sifli-regbank.h"
 
 if [ -f "$SRC/scripts/checkpatch.pl" ]; then
     for f in $NEW_FILES; do
         [ -f "$SRC/$f" ] || { skip "$f 不存在"; continue; }
-        out=$(cd "$SRC" && perl scripts/checkpatch.pl --no-tree --file "$f" 2>&1)
+        # 必须给**绝对路径**。checkpatch 有若干规则按 $realfile 里的 "/hw/" 之类
+        # 匹配，相对路径 "hw/dma/x.c" 里没有前导那个 "/"，规则就静默不触发——
+        # 于是 0 errors 是个假通过。qemu_bh_new 必须换成 aio_bh_new_guarded 那条
+        # 就是这么漏掉的。
+        out=$(cd "$SRC" && perl scripts/checkpatch.pl --no-tree --file "$SRC/$f" 2>&1)
         # checkpatch 只在有 ERROR 时返回非零，所以要抓 summary 行
         if echo "$out" | grep -qE '^total: 0 errors, 0 warnings'; then
             pass "$f"
@@ -86,6 +92,7 @@ if [ -d "$SRC/.git" ]; then
               $NEW_FILES \
               hw/arm/Kconfig hw/arm/meson.build \
               hw/char/Kconfig hw/char/meson.build \
+              hw/dma/Kconfig hw/dma/meson.build \
               hw/misc/Kconfig hw/misc/meson.build 2>/dev/null \
           | grep 'w/crlf' || true)
     if [ -z "$bad" ]; then
@@ -157,6 +164,19 @@ EOF
             fi
         done
 
+        # 两个 DMAC 的 region 同名，所以按地址认，两个都必须在。
+        while read -r a what; do
+            [ -n "$a" ] || continue
+            if echo "$probe" | grep -q "$a-.*sifli-dma"; then
+                pass "$what 已映射（$a）"
+            else
+                fail "$what 不在 info mtree 里（$a）"
+            fi
+        done <<'EOF'
+50081000 DMAC1
+40001000 DMAC2
+EOF
+
         # 地址 期望值 说明
         while read -r addr want what; do
             [ -n "$addr" ] || continue
@@ -202,10 +222,15 @@ echo
 # 这一项才是真正的验收。
 #
 # 第 6、7 项只是结构性地读几个寄存器，模型写错了它们照样能过
-# （peripherals.md §6.2 那个 DWT 映射错位的坑就骗过了它们全部）。只有这里
+# （peripherals.md §7.2 那个 DWT 映射错位的坑就骗过了它们全部）。只有这里
 # ——SDK 原样构建的真实板子固件、一行不改——能证明整个 HAL 真的在模型上跑
 # 起来了：时钟树、电源、RTC、MPI、音频、控制台，一路到 main() 和 RT-Thread
 # 的 shell。
+#
+# 而且还要往提示符里敲命令 —— 这是唯一能验到 **接收** 通路的地方。控制台把
+# uart1 按 DMA 模式打开（board.conf 的 CONFIG_BSP_UART1_RX_USING_DMA），字节
+# 要经 USART 的 dma-rx 请求线、DMA 通道、再由 IDLE 中断反推长度，才能到 shell。
+# 这条链上任何一环断了，提示符照样打得出来，只是敲什么都没反应。
 #
 # 固件用 scons 构建：
 #   cd <SDK>/example/get-started/hello_world/rtt/project
@@ -220,29 +245,57 @@ else
     # 不带 -semihosting：固件必须走真实的 HAL UART 驱动，走我们的 USART 模型，
     # 输出经 chardev 到 stdout。带了 -semihosting 就等于绕开了要验的东西。
     #
+    # 用 -serial stdio -monitor none 而不是 -nographic：后者是 mon:stdio，
+    # 输入要先过 monitor 的 mux，敲进去的字符走的是另一条路。这里要验的正是
+    # "-serial" 那条。
+    #
     # 固件跑到 shell 就停在那儿等输入，永远不会自己退出，所以只能看着输出把它
-    # 杀掉。不这么做的话这一项要白等满 60 秒——实测 2.6 秒就到底了。
+    # 杀掉。不这么做的话这一项要白等满 60 秒——实测 3 秒就到底了。
+    fifo=$(mktemp -u)
     log=$(mktemp)
-    timeout 60 "$BUILD/qemu-system-arm" -M sf32lb52x -nographic \
-        -kernel "$REAL_FW" > "$log" 2>&1 &
+    mkfifo "$fifo"
+
+    # FIFO 读写都开着（<>）：O_RDWR 打开 FIFO 不阻塞，而且只要这个 fd 还在，
+    # 写端就没全关。全关掉的话 QEMU 会从 stdin 读到 EOF、把串口关掉，之后
+    # 再往里写就没人接了。
+    exec 3<>"$fifo"
+    timeout 60 "$BUILD/qemu-system-arm" -M sf32lb52x \
+        -display none -serial stdio -monitor none \
+        -kernel "$REAL_FW" < "$fifo" > "$log" 2>&1 &
     qpid=$!
-    for _ in $(seq 1 600); do          # 600 × 0.1s，和上面那个 timeout 对齐
+
+    # 600 × 0.1s，和上面那个 timeout 对齐
+    for _ in $(seq 1 600); do
         grep -q 'msh />' "$log" 2>/dev/null && break
         kill -0 "$qpid" 2>/dev/null || break   # QEMU 自己退了（出错）就别等了
         sleep 0.1
     done
+
+    # 提示符出来后再敲命令，然后等 shell 的回应 —— 而不只是等命令被回显。
+    # "RT-Thread shell commands:" 是 msh_help() 的第一行（finsh/msh.c）。
+    printf 'help\r' >&3
+    for _ in $(seq 1 150); do
+        grep -q 'RT-Thread shell commands:' "$log" 2>/dev/null && break
+        kill -0 "$qpid" 2>/dev/null || break
+        sleep 0.1
+    done
+
     kill "$qpid" 2>/dev/null
     wait "$qpid" 2>/dev/null
+    exec 3>&-
+    rm -f "$fifo"
 
     # sed 去掉 RT-Thread 日志的 ANSI 颜色码（[32;22m...）
     out=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
     rm -f "$log"
 
     missing=""
-    echo "$out" | grep -q "Hello world" || missing="$missing main()输出"
-    echo "$out" | grep -q "msh />"      || missing="$missing msh提示符"
+    echo "$out" | grep -q "Hello world"              || missing="$missing main()输出"
+    echo "$out" | grep -q "msh />"                   || missing="$missing msh提示符"
+    echo "$out" | grep -q "RT-Thread shell commands:" \
+        || missing="$missing 敲 help 的回应（收通路没通）"
     if [ -z "$missing" ]; then
-        pass "启动到 main()，停在 RT-Thread msh 提示符"
+        pass "启动到 main()，msh 提示符接受输入并回 help 的命令表"
     else
         fail "没看到：$missing。最后几行："
         echo "$out" | tail -6 | sed 's/^/         /'

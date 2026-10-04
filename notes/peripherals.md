@@ -21,9 +21,9 @@
 
 | | 有行为 | 纯配置 |
 |---|---|---|
-| 例子 | USART、以后的 I2C/SPI/DMA/MPI | RCC、AON、PMUC、HPSYS_CFG、PINMUX |
+| 例子 | USART、DMA、MPI、以后的 I2C/SPI | RCC、AON、PMUC、HPSYS_CFG、PINMUX |
 | 实现 | 独立的 QOM sysbus 设备 | 数据表 + 通用 `sifli-regbank` |
-| 文件 | `hw/char/sifli-usart.c` | `hw/misc/sifli-regbank.c` + `hw/arm/sf32lb52x-periph.c` |
+| 文件 | `hw/char/sifli-usart.c`、`hw/dma/sifli-dma.c` | `hw/misc/sifli-regbank.c` + `hw/arm/sf32lb52x-periph.c` |
 
 这么分的原因很直接：RCC + AON + PMUC + CFG 加起来四百多个寄存器，**没有一个是
 有行为的**。固件对它们的全部要求就是"写完 enable 之后，某个状态位能读到 1"。
@@ -263,8 +263,9 @@ stage 字段反推（`freq = stg * 24M + 24M`），而 `EnableDLL` 写进去的�
   最后那行是**没有超时的裸 while**，TC 不置位就是死循环。
 - **BUSY（ISR bit16）和 EXR 读 0**：永远没有正在进行的传输。
 - 接收一个字节缓冲，RXNE 置位、读 RDR 清位；没被读走时告诉 chardev 先别送。
-- `BRR`/`CR2`/`CR3`/`MISCR`/`GTPR`/`RTOR` 只存不生效——波特率、流控、采样点
-  都不影响主机看到的一个字符。
+- `BRR`/`CR2`/`MISCR`/`GTPR`/`RTOR` 只存不生效——波特率、流控、采样点
+  都不影响主机看到的一个字符。`CR3` 也只存，**只有 `DMAR`(bit6) 例外**：
+  它决定 `dma-rx` 那条请求线举不举（见 §5.1）。
 
 **不用做**：TEACK/REACK（52x 的 `UART_CheckIdleState` 把等待 `#if 0` 掉了）、
 DRDR/DTDR（HAL 从不碰）、FIFO 使能（HAL 里没有 `FIFOEN` 写入）。
@@ -275,9 +276,78 @@ DRDR/DTDR（HAL 从不碰）、FIFO 使能（HAL 里没有 `FIFOEN` 写入）。
 所以中断条件不能写成两个寄存器相与，要一个个判。ICR→ISR 的位映射同理
 （`TCBGTCF` 是 ICR bit7，`TCBGT` 是 ISR bit25），按名字翻译而不是移位。
 
+### 接收走 DMA，不走 RXNE 中断
+
+这块板子的控制台**把 uart1 按 DMA 模式打开**（`board.conf` 的
+`CONFIG_BSP_UART1_RX_USING_DMA=y`），所以模型里那条 RXNE→中断的路固件根本
+不走：字节要经 USART 的请求线 → DMA 通道 → 再由 IDLE 中断反推收到了多少，
+才能到 shell。只把 USART 做对，表现是提示符打得出来、敲什么都没反应。
+
 ---
 
-## 5. 加一个新外设
+## 5. DMA 控制器
+
+`hw/dma/sifli-dma.c`。寄存器定义在 `drivers/cmsis/sf32lb52x/dmac.h`（**每系列
+一份**，和 USART 不同），基址由 machine 传进来：DMAC1 在 HPSYS、DMAC2 在 LPSYS。
+八个通道，每个通道是一段 0x14 字节的平铺寄存器，不是结构体数组。
+
+### 5.1 请求是电平，不是脉冲
+
+DMA 只有 **64 条按请求号索引的输入线**，不是每个通道一条。这是照着
+`CSELRn` 那个请求 mux 建的：控制器只知道"请求号 n 到了"，要知道该哪个通道
+干活，得去查 `CSELRn`——**而且每次搬运都重查**，因为 HAL 的
+`DMA_AllocChannel` 会挑第一个空闲通道，请求随时可能换通道。
+
+请求线是**电平**：源一直举着，直到消费它的那次搬运发生。这一点是必需的，
+不是风格问题——控制台重开时固件会先 `HAL_DMA_Start` 再置 `CR3.DMAR`，而在
+那之前到达的字节只能靠"线还举着"被重新发现。所以 `CCR` 的 EN 0→1 和
+`CSELRn` 的写入都要**重扫一遍所有请求线**，否则重开后敲的第一个字符会烂在
+RDR 里，直到下一次按键才出来。
+
+### 5.2 重入守卫是必需的
+
+搬运一字节靠的是 `address_space_read(CPAR)`，而 CPAR 指向 USART 的 RDR——
+那个读会清 RXNE 并调 `qemu_chr_fe_accept_input()`，它**同步**回调进
+`sifli_usart_receive()`，把下一个字节放进 RDR、又把请求线举起来，于是嵌套
+进入 DMA 处理。
+
+没有守卫的话，嵌套那次会用**还没推进的 CM0AR** 写第二个字节，悄悄把环形缓冲
+写坏。所以：
+
+- `req_level[n] = level` 在守卫判断**之前**记录——否则嵌套那次的边沿丢了，
+  它带来的那个字节就没人搬。
+- 外层在守卫内**循环**搬运，直到请求线落下，把嵌套送来的字节在外层 CM0AR
+  已经推进之后消费掉。
+
+每次调用最多搬 `SIFLI_DMA_MAX_DRAIN` 个，剩下的交给 bottom half——粘一大段
+文本进来时不该把线程占在那儿搬完。
+
+### 5.3 环形模式必须重装地址，不只是重装计数
+
+CIRC 绕回时，硬件**把 CM0AR 也恢复到通道使能时的值**，不只是 `CNDTR`。
+只重装计数的话，缓冲区一绕回就一路往后写：uart1 的 DMA 目标是 RT-Thread 的
+64 字节接收环（`RT_SERIAL_RB_BUFSZ`），一次粘 420 字节进去就会踩掉后面
+356 字节的堆——表现是 RT-Thread 在 `rt_thread_timeout` 里断言失败然后 hardfault。
+所以使能时锁存 `cpar_reload`/`cm0ar_reload`，绕回时一起恢复。
+
+> 顺带一提：64 字节的环装不下 420 字节的粘贴，**真板子也一样丢**（IDLE 只在
+> 一批结束时来一次）。这种丢数据是固件缓冲区的性质，不是模型的锅；模型要保证
+> 的是**不越界**。
+
+### 5.4 不做的事
+
+- **TEIF 不置位**：模型能搬的东西不会失败。
+- **优先级（PL）、CBSR、DBGSEL 只存不生效**：没有竞争的总线要仲裁，也没有
+  总线错误要上报。
+- **HT/TC 标志照置**（`ISR` 里可见），但通道 IRQ 只在对应的 `TCIE`/`HTIE`/`TEIE`
+  置位时才拉高。UART RX 这条路上两个回调都没人接（尽头是弱符号空函数），
+  真正干活的是 IDLE。
+- **MEM2MEM 会在置 EN 时直接跑完**：这类通道没有外设来举请求线。`drv_lcd_fb.c`
+  用了它。CIRC+MEM2MEM 会无限重写同一块缓冲，所以同样受搬运预算限制。
+
+---
+
+## 6. 加一个新外设
 
 **纯配置的（GPIO 配置、PINMUX、LPSYS_CFG…）**：
 1. 在 `sf32lb52x-periph.c` 里加一张 `SifliRegDef[]` 表
@@ -295,7 +365,7 @@ DRDR/DTDR（HAL 从不碰）、FIFO 使能（HAL 里没有 `FIFOEN` 写入）。
 
 ---
 
-## 6. 真实固件 bring-up 记录
+## 7. 真实固件 bring-up 记录
 
 用 `sf32lb52-lcd_a128r16` 的 `hello_world`（SDK 原样构建，固件一行不改）逐个
 排查出来的。**这些用 `hello_qemu` 那种 semihosting 桩永远发现不了**——它一个
@@ -304,7 +374,7 @@ HAL 寄存器都不碰。
 排查手法：固件跑起来后从 monitor 采 `info registers` 看 PC，两次采样相同就是
 死循环，再用 `arm-none-eabi-addr2line` 把地址翻回源码行。
 
-### 6.1 DWT 周期计数器（QEMU 的缺口）
+### 7.1 DWT 周期计数器（QEMU 的缺口）
 
 PC 停在 `HAL_Delay_us_`（`bf0_hal.c:407`）：
 
@@ -320,9 +390,9 @@ bcc.n ...
 `HAL_RCC_HCPU_ConfigHCLK(240)` → `EnableDLL1` → `HAL_Delay_us(10)`。
 
 补了 `hw/misc/armv7m_dwt.c`（和 `armv7m_ras.c` 并列，同挂 `CONFIG_ARM_V7M`）。
-见 §6.2 关于它为什么必须挂进 armv7m 的 container。
+见 §7.2 关于它为什么必须挂进 armv7m 的 container。
 
-### 6.2 armv7m container 的优先级陷阱
+### 7.2 armv7m container 的优先级陷阱
 
 把 DWT 映射进 board 的 system memory **不生效**，尽管 `info mtree -f` 里能看到它：
 
@@ -348,7 +418,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 **教训**：`info mtree` 会把重叠的两段都列出来，光看它会被骗。要确认一个
 区域真的生效，得实际读写它。
 
-### 6.3 RTC 的 LXT 使能位（分支走错）
+### 7.3 RTC 的 LXT 使能位（分支走错）
 
 越过 DWT 后卡在 `bf0_hal_lrc_cal.c:894`，轮询 BT MAC 的 `RCCAL_RESULT`。
 
@@ -366,7 +436,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 把 RTC 块建起来让这一位存住即可，**比为了这一位去建模 BT MAC 便宜得多**，
 也更接近真实板子（板上有 LXT 晶振）。
 
-### 6.4 MPI 的 CALCR.DONE
+### 7.4 MPI 的 CALCR.DONE
 
 `HAL_MPI_OPSRAM_CAL_DELAY`（`bf0_hal_mpi_psram.c:1386`）：写 `CALCR.EN`(bit31)
 启动校准，然后轮询 `CALCR.DONE`(bit8)。和 RCC 的 `HRCCAL1.CAL_DONE` 同型
@@ -381,7 +451,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 | `SR.BUSY` bit31 | 忙 | `HAL_FLASH_IS_BUSY()` |
 | `CALCR.DONE` bit8 | 校准完成 | `bf0_hal_mpi_psram.c:1386` |
 
-### 6.5 RTC_ISR 的六个就绪标志
+### 7.5 RTC_ISR 的六个就绪标志
 
 `RTC_EnterInitMode`（`bf0_hal_rtc.c:1009`）置 `ISR.INIT`(bit10) 后等
 `ISR.INITF`(bit9)。把 `bf0_hal_rtc.c` 里所有 `while` 找出来后发现有六个
@@ -402,7 +472,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 才知道那个分支被 `if (hrtc->Instance->CR & RTC_CR_WUTE)` 保护着，而 WUTE 我们
 从不置位，所以强制置 1 是安全的。**这类冲突必须读代码，猜不出来。**
 
-### 6.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
+### 7.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
 
 音频这块**故意只建了极少的寄存器**，其余留白：
 
@@ -430,7 +500,7 @@ pll_cnt = PLL_CAL_RESULT >> PLL_CNT_Pos;
 
 **先判断循环是否本身有界，再决定要不要伪造终态。**
 
-### 6.7 结果
+### 7.7 结果
 
 `sf32lb52-lcd_a128r16` 的 `hello_world`，SDK 原样构建、一行不改：
 
@@ -451,7 +521,7 @@ msh />
 跑到 `main()` 并停在 RT-Thread 的 msh 提示符上。`notes/verify-sifli.sh` 第 8 项
 就是跑这个。
 
-### 6.8 规律
+### 7.8 规律
 
 到目前为止**每一个坑都是同一个形状**：没建模的寄存器读回 0，固件据此做了
 一个真实硬件上不会做的判断，然后走进死循环或错误分支。所以薄模型的重点
@@ -459,7 +529,7 @@ msh />
 
 ---
 
-## 7. 排查
+## 8. 排查
 
 **看固件碰了哪些没建模的地址**：
 
@@ -482,7 +552,8 @@ create_unimplemented_device("sifli.xxx", BASE, SIZE);   /* 需要 hw/misc/unimp.
 (qemu) info mtree
 ```
 
-应能看到 `sf32lb52x.hpsys_rcc`、`sf32lb52x.pmuc`、`sifli-usart` 等区域。
+应能看到 `sf32lb52x.hpsys_rcc`、`sf32lb52x.pmuc`、`sifli-usart`、`sifli-dma`
+等区域。
 `notes/verify-sifli.sh` 的第 7 项就是自动做这件事。
 
 **加一个没被强制但固件在等的位**：直接 grep HAL：
