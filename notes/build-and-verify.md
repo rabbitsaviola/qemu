@@ -5,14 +5,17 @@
 
 **所有操作都在 WSL 里做**——Windows 侧没有 gcc/meson，编不了。
 
-`notes/` 下的东西：
+脚本都在 `notes/` 下（不在 $HOME）：**本地开发**用前四个，**分发产物**用后两个。
 
 | 文件 | 用途 |
 |---|---|
-| `build-sifli.sh` | 构建（`notes/build-and-verify.md` 就是本文） |
-| `verify-sifli.sh` | 一条命令跑完八项检查，退出码可直接进 CI |
+| `build-sifli.sh` | 本地构建（configure 过就跳过，日常只跑 ninja） |
+| `verify-sifli.sh` | 一条命令跑完九项检查，退出码可直接进 CI |
 | `qtest-sifli.sh` | 单独验外设写路径，被 verify 的第 8 项调用 |
 | `peripherals.md` | 外设模型是怎么设计的、怎么加新的 |
+| `build-and-verify.md` | 本文 |
+| `../build-dist.sh` | 构建**可分发的产物**（三平台），见 §6 |
+| `../build-static-deps.sh` | macOS 的静态依赖，被 build-dist.sh 调用 |
 
 ---
 
@@ -180,9 +183,18 @@ git log -1 --format=%B | grep -E "^(Signed-off-by|Co-Authored-By)"
 上面每一项都是 `notes/verify-sifli.sh` 里的一个检查项：
 
 ```bash
-bash notes/verify-sifli.sh            # 固件默认用 qemu-support 的 hello_qemu
-bash notes/verify-sifli.sh fw.elf     # 换个固件
-bash notes/verify-sifli.sh -          # 跳过固件那一项
+bash notes/verify-sifli.sh            # 默认固件
+bash notes/verify-sifli.sh fw.elf     # 换第 5 项那个冒烟固件
+bash notes/verify-sifli.sh -          # 跳过第 5 项
+```
+
+两个固件是两个独立的东西：第 5 项的冒烟固件走 semihosting 桩，第 9 项的真实板子
+固件走完整 HAL。第 9 项那个用环境变量指定：
+
+```bash
+SIFLI_REAL_FW=/path/to/main.elf bash notes/verify-sifli.sh
+# 或跳过它（也是 "-"）
+SIFLI_REAL_FW=- bash notes/verify-sifli.sh
 ```
 
 九项检查，全部通过退出码 0，可直接进 CI：
