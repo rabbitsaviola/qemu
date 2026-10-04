@@ -105,6 +105,7 @@ config SIFLI_SF32LB52X
     default y
     depends on TCG && ARM
     select ARM_V7M
+    select SIFLI_REGBANK
 
 config MPS3R
     bool

@@ -25,6 +25,9 @@ system_ss.add(when: 'CONFIG_IOSB', if_true: files('iosb.c'))
 # virt devices
 system_ss.add(when: 'CONFIG_VIRT_CTRL', if_true: files('virt_ctrl.c'))
 
+# SiFli devices
+system_ss.add(when: 'CONFIG_SIFLI_REGBANK', if_true: files('sifli-regbank.c'))
+
 # RISC-V devices
 system_ss.add(when: 'CONFIG_MCHP_PFSOC_DMC', if_true: files('mchp_pfsoc_dmc.c'))
 system_ss.add(when: 'CONFIG_MCHP_PFSOC_IOSCB', if_true: files('mchp_pfsoc_ioscb.c'))

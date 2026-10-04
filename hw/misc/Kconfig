@@ -192,6 +192,9 @@ config MCHP_PFSOC_IOSCB
 config MCHP_PFSOC_SYSREG
     bool
 
+config SIFLI_REGBANK
+    bool
+
 config SIFIVE_TEST
     bool
 
