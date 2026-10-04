@@ -148,15 +148,19 @@ cd "${BUILD_DIR}"
 # fit in a small WSL VM, and nproc has no way to know that. (Set it on the
 # command line: JOBS=6 bash build-dist.sh.)
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
-ninja -j"${JOBS}" qemu-system-arm qemu-system-aarch64
+
+# Meson names a ninja target after the file it produces, so on Windows the
+# target carries the .exe suffix and the plain name is unknown to ninja.
+EXE=""
+[ "${PLATFORM}" = windows ] && EXE=".exe"
+
+ninja -j"${JOBS}" "qemu-system-arm${EXE}" "qemu-system-aarch64${EXE}"
 
 echo
 echo "=== Bundling distributable ==="
 rm -rf "${DIST_DIR}"
 mkdir -p "${DIST_DIR}/bin" "${DIST_DIR}/lib"
 
-EXE=""
-[ "${PLATFORM}" = windows ] && EXE=".exe"
 for target in arm aarch64; do
     cp "${BUILD_DIR}/qemu-system-${target}${EXE}" "${DIST_DIR}/bin/"
     strip "${DIST_DIR}/bin/qemu-system-${target}${EXE}" 2>/dev/null || true
