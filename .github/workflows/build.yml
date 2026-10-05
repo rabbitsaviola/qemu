@@ -41,14 +41,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential ninja-build pkg-config python3-venv \
-            libglib2.0-dev libpixman-1-dev
+            libglib2.0-dev libpixman-1-dev libsdl2-dev
 
       - name: Install dependencies (macOS)
         if: matrix.os == 'macos'
         run: |
           # Build tools only: libraries are compiled statically from pinned
-          # sources by build-static-deps.sh.
-          brew install pkg-config ninja meson
+          # sources by build-static-deps.sh. cmake is there for SDL2, the one
+          # dependency that builds with CMake rather than autotools or meson.
+          brew install pkg-config ninja meson cmake
 
       - name: Cache static deps (macOS)
         if: matrix.os == 'macos'
@@ -81,6 +82,9 @@ jobs:
             mingw-w64-x86_64-pixman
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-python
+            # The display backend. Its DLL comes out of /mingw64, which is
+            # where build-dist.sh looks when it copies the runtime closure.
+            mingw-w64-x86_64-SDL2
 
       - name: Build (Linux, macOS)
         if: matrix.os != 'windows'

@@ -12,7 +12,7 @@
 #
 # Usage: bash build-static-deps.sh [--prefix DIR]
 #
-# Prerequisites: Apple CLT (clang/make), pkg-config, meson, ninja, curl.
+# Prerequisites: Apple CLT (clang/make), pkg-config, meson, ninja, cmake, curl.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +39,8 @@ PIXMAN_VERSION=0.46.4
 PIXMAN_SHA256=d09c44ebc3bd5bee7021c79f922fe8fb2fb57f7320f55e97ff9914d2346a591c
 GLIB_VERSION=2.86.1
 GLIB_SHA256=119d1708ca022556d6d2989ee90ad1b82bd9c0d1667e066944a6d0020e2d5e57
+SDL2_VERSION=2.30.9
+SDL2_SHA256=24b574f71c87a763f50704bbb630cbe38298d544a1f890f099a4696b1d6beba4
 
 # Rebuild only when this script (versions, flags) changes.
 STAMP="${PREFIX}/.stamp"
@@ -88,6 +90,13 @@ build_meson() { # <meson setup args...>
     ninja -C _build install >/dev/null
 }
 
+build_cmake() { # <cmake args...>  (SDL is the only CMake dependency here)
+    cmake -S . -B _build -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+        -DCMAKE_BUILD_TYPE=Release "$@" >/dev/null
+    cmake --build _build --parallel "${JOBS}" >/dev/null
+    cmake --install _build >/dev/null
+}
+
 # zlib comes from the macOS SDK, not the staging prefix -- but staged .pc files
 # (libpng) declare "Requires: zlib", which the hermetic PKG_CONFIG_LIBDIR could
 # not otherwise satisfy.
@@ -127,6 +136,16 @@ fetch "https://download.gnome.org/sources/glib/${GLIB_VERSION%.*}/glib-${GLIB_VE
 # sysprof=disabled: keeps meson from git-fetching the sysprof subproject --
 # everything built here must come from the pinned tarballs above.
 build_meson -Dtests=false -Dintrospection=disabled -Dsysprof=disabled
+
+echo "=== SDL2 ${SDL2_VERSION} (the display backend) ==="
+fetch "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-${SDL2_VERSION}.tar.gz" "${SDL2_SHA256}"
+# SDL_SHARED=OFF, so only libSDL2.a is installed. A shared one would put an
+# absolute path into the staging prefix into the shipped binary, which is
+# exactly what build-dist.sh's otool check rejects. CMake writes sdl2.pc from
+# whatever it actually built, so the file then carries the static link line --
+# Cocoa, IOKit, CoreVideo and the rest -- and that is what reaches the link
+# line through build-dist.sh's `pkg-config --static` wrapper.
+build_cmake -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF
 
 echo "${SELF_HASH}" > "${STAMP}"
 echo "=== Static deps ready: ${PREFIX} ==="

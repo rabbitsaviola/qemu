@@ -70,7 +70,7 @@ else
       --disable-guest-agent \
       --disable-werror \
       --disable-gtk \
-      --disable-sdl \
+      --enable-sdl \
       --disable-vnc \
       --disable-curses \
       --disable-opengl \

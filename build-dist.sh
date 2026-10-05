@@ -12,7 +12,8 @@
 #            also keeps them patched -- bundling would freeze versions, and it
 #            would not remove the glibc floor anyway since glibc is never
 #            bundled. It would only make the bundle look more portable than it
-#            is. Install libglib2.0-0 and libpixman-1-0 to run it.
+#            is. Install libglib2.0-0, libpixman-1-0 and libsdl2-2.0-0 to run
+#            it; the script prints the list it reads off the binaries.
 #   macOS    nothing, but third-party libraries are linked statically
 #            (build-static-deps.sh) so only system libraries remain. Without
 #            that the binaries would carry absolute Homebrew paths.
@@ -23,10 +24,11 @@
 #
 # Prerequisites:
 #   Debian/Ubuntu: sudo apt install build-essential ninja-build pkg-config \
-#                       python3-venv patchelf libglib2.0-dev libpixman-1-dev
-#   macOS:         brew install pkg-config ninja meson
+#                       python3-venv patchelf libglib2.0-dev libpixman-1-dev \
+#                       libsdl2-dev
+#   macOS:         brew install pkg-config ninja meson sdl2
 #                  (libraries are built from source -- see build-static-deps.sh)
-#   MSYS2:         pacman -S mingw-w64-x86_64-{gcc,ninja,meson,pkgconf,glib2,pixman,python}
+#   MSYS2:         pacman -S mingw-w64-x86_64-{gcc,ninja,meson,pkgconf,glib2,pixman,SDL2,python}
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,9 +58,14 @@ else
     PYTHON="${VENV_DIR}/bin/python3"
 fi
 
-# A lean emulator needs almost nothing: no display backend, no networking, no
-# block layer, no accelerators but TCG. Every dependency switched off here is
-# one fewer library to bundle below.
+# A lean emulator needs almost nothing: no networking, no block layer, no
+# accelerators but TCG. Every dependency switched off here is one fewer library
+# to bundle below.
+#
+# SDL is the one display backend kept: it is what puts the emulated panel on
+# the host's screen, which is the whole point of the LCDC model. It is also the
+# only reason these bundles have a runtime dependency beyond glib and pixman,
+# so the Linux branch below prints what it actually pulls in.
 CONFIGURE_ARGS=(
     --target-list=arm-softmmu
     --python="${PYTHON}"
@@ -68,7 +75,7 @@ CONFIGURE_ARGS=(
     --disable-werror
     # display
     --disable-gtk
-    --disable-sdl
+    --enable-sdl
     --disable-vnc
     --disable-curses
     --disable-opengl
@@ -258,9 +265,9 @@ windows)
     ;;
 esac
 
-# pc-bios keymaps are only read by display backends, all of which are off; the
-# binaries locate data relative to themselves, so keep the layout they expect
-# in case one is ever enabled.
+# pc-bios keymaps are read by the display backend -- SDL, here: it maps host
+# keys through them. The binaries locate data relative to themselves, so the
+# layout matters.
 mkdir -p "${DIST_DIR}/share/qemu"
 cp -r "${SCRIPT_DIR}/pc-bios/keymaps" "${DIST_DIR}/share/qemu/" 2>/dev/null || true
 
