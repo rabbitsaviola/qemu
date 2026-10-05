@@ -146,4 +146,5 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
 modules += { 'hw-display': hw_display_modules }
 
+system_ss.add(when: 'CONFIG_SIFLI_EPIC', if_true: files('sifli-epic.c'))
 system_ss.add(when: 'CONFIG_SIFLI_EZIP', if_true: [files('sifli-ezip.c'), zlib])

@@ -150,5 +150,8 @@ config MAC_PVG_PCI
     depends on MAC_PVG && PCI
     default y if PCI_DEVICES
 
+config SIFLI_EPIC
+    bool
+
 config SIFLI_EZIP
     bool
