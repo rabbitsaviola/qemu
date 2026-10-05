@@ -10,8 +10,8 @@
 | 文件 | 用途 |
 |---|---|
 | `build-sifli.sh` | 本地构建（configure 过就跳过，日常只跑 ninja） |
-| `verify-sifli.sh` | 一条命令跑完十项检查，退出码可直接进 CI |
-| `qtest-sifli.sh` | 单独验外设写路径，被 verify 的第 8 项调用 |
+| `verify-sifli.sh` | 一条命令跑完十一项检查，退出码可直接进 CI |
+| `qtest-sifli.sh` | 单独验外设写路径，被 verify 的第 7 项调用 |
 | `peripherals.md` | 外设模型是怎么设计的、怎么加新的 |
 | `build-and-verify.md` | 本文 |
 | `../build-dist.sh` | 构建**可分发的产物**（三平台），见 §6 |
@@ -234,10 +234,32 @@ xp /1wx 0x60417afc
 ——位置错一个像素，采样点就会落到另一个区域上，值立刻不对。
 
 这一项同时验到了 PSRAM：`.RW_PSRAM_NON_RET` 有 0x868a0 字节，`hello_world`
-里这个段是 0，所以第 8 项从来没碰过 PSRAM。顺带也验了 EPIC 的两条地址通路
+里这个段是 0，所以第 9 项从来没碰过 PSRAM。顺带也验了 EPIC 的两条地址通路
 ——`AHB_MEM` 走 CPU 地址、图层 `SRC` 走 SBUS 别名，见 `peripherals.md` §8.2。
 
-### ③ 代码格式
+### ③ 看画面
+
+**必须带 `-device sifli-panel`**，否则 LCDC 不知道该画多大、驱动也认不出屏
+（固件打 `unknow lcd!`，屏幕黑但不崩）：
+
+```bash
+~/build-sifli/qemu-system-arm -M sf32lb52x -device sifli-panel -display sdl \
+    -serial stdio \
+    -kernel <SDK>/example/rt_driver/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
+```
+
+WSL 里 `DISPLAY=:0` 由 WSLg 提供，不用额外配置。换屏是换命令行，不改 QEMU：
+
+```bash
+-device sifli-panel,id=0x60834200,width=480,height=272
+```
+
+看不到画面时按这个顺序查：`-display none` 下 `screendump` 有没有内容（第 8 项
+就是自动化的这一条）→ 串口有没有 `CO5300_ReadID 0x331100` → 有没有
+`Fill framebuffer addr=`。三者依次对应读数路径、`-device` 有没有给、固件有没有
+真的在刷屏。
+
+### ④ 代码格式
 
 ```bash
 cd ~/code/sifli-qemu
@@ -304,7 +326,7 @@ ERROR: space prohibited after that '&' (ctx:WxW)
 `Msk` 以大写 `M` 开头但不是"大写串+小写"的形状，不触发启发式。两种写法结果
 一样，SDK 的头文件本身就是这个约定。
 
-### ④ 属性生效
+### ⑤ 属性生效
 
 ```bash
 # 默认 0x10000000；显式给 QSPI2 的基址会 fault（固件按 0x10000000 链接，取不到向量表）
@@ -312,7 +334,7 @@ ERROR: space prohibited after that '&' (ctx:WxW)
 ./qemu-system-arm -M sf32lb52x,flash-size=0x800000 -nographic -kernel <fw.elf>
 ```
 
-### ⑤ 提交完整性
+### ⑥ 提交完整性
 
 ```bash
 cd ~/code/sifli-qemu
@@ -336,11 +358,11 @@ SIFLI_REAL_FW=/path/to/main.elf bash notes/verify-sifli.sh   # 换固件
 SIFLI_REAL_FW=- bash notes/verify-sifli.sh       # 跳过固件那一项
 ```
 
-第 9、10 项各自要一个例程固件，路径不合适就用 `SIFLI_EZIP_FW=` / `SIFLI_EPIC_FW=`
+第 10、11 项各自要一个例程固件，路径不合适就用 `SIFLI_EZIP_FW=` / `SIFLI_EPIC_FW=`
 覆盖（`SIFLI_EZIP_TOOL=` 指宿主的 `ezip_linux`）；固件或工具不在就整项 `[SKIP]`，
 不会假装通过。
 
-十项检查，全部通过退出码 0，可直接进 CI：
+十一项检查，全部通过退出码 0，可直接进 CI：
 
 | # | 检查 | 性质 |
 |---|---|---|
@@ -351,20 +373,26 @@ SIFLI_REAL_FW=- bash notes/verify-sifli.sh       # 跳过固件那一项
 | 5 | 提交带 Signed-off-by 且与 author 一致 | |
 | 6 | 外设区域都映射了，寄存器读回值正确 | 结构性 |
 | 7 | 外设写路径（qtest） | 结构性 |
-| **8** | **真实板子固件跑到 `main()` 和 msh 提示符** | **真正的验收** |
-| 9 | EZIP 例程四条解码与资产逐字节一致 | 结果正确性 |
-| 10 | EPIC 例程混合出来的像素对 | 结果正确性 |
+| 8 | 画面真的出去了（写显存 + screendump 解像素） | 结构性 |
+| **9** | **真实板子固件跑到 `main()` 和 msh 提示符** | **真正的验收** |
+| 10 | EZIP 例程四条解码与资产逐字节一致 | 结果正确性 |
+| 11 | EPIC 例程混合出来的像素对 | 结果正确性 |
 
-**第 8 项才是关键。** 第 6、7 项只是读几个寄存器，**模型写错了它们照样能过**
-——`peripherals.md` §10.2 那个 DWT 映射错位的坑就骗过了它们全部。只有 SDK 原样
-构建的真实板子固件、一行不改地跑到 `main()`，才能证明整个 HAL 真的在模型上跑
-起来了——时钟树、电源、RTC、MPI、音频、控制台，整条链路。第 9、10 项再用例程
-自带的结果验一遍**算得对不对**。
+**第 9 项才是关键。** 第 6–8 项都够不着 HAL：第 6、7 只读几个寄存器，
+**模型写错了照样能过**——`peripherals.md` §11.2 那个 DWT 映射错位的坑就骗过了
+它们全部。只有 SDK 原样构建的真实板子固件、一行不改地跑到 `main()`，才能证明
+整个 HAL 真的在模型上跑起来了——时钟树、电源、RTC、MPI、音频、控制台，整条链路。
+第 10、11 项再用例程自带的结果验一遍**算得对不对**。
+
+**第 8 项补的是第 6、7 项够不着的另一半**：寄存器读写对，不等于像素出去了。
+它往显存放一块已知颜色、START、再让 monitor `screendump` 截图，然后解 PPM
+断言具体像素。不需要固件、不需要 SDL，所以进 CI。
 
 不跑脚本时手工至少查这几条：
 
 ```
 □ 两个二进制的 -M help 都能看到 sf32lb52x
+□ -device sifli-panel 下 screendump 的 PPM 里那块颜色是对的
 □ 真实板子固件能跑出 "Hello world!" 和 msh 提示符（不带 -semihosting）
 □ ezip 例程四句 [EZIP]Output is correct.
 □ epic 例程打 "EPIC blend succeeded"
@@ -490,6 +518,23 @@ printf 'readl 0x5000001c\nwritel 0x50000010 0x10\nreadl 0x50000008\nquit\n' \
 `-device loader,addr=...,data=...,data-len=4` 也能写物理地址，但它在设备 reset
 **之前**执行，写进寄存器会被复位冲掉（写 SRAM 不受影响）。所以测寄存器要用 qtest。
 
+**没有 `-kernel` 时必须加 `-S`**，否则 QEMU 会被 HardFault 打死：
+
+```
+qemu: fatal: Lockup: can't escalate 3 to HardFault (current priority -1)
+```
+
+qtest **不是**"只跑设备、不跑 CPU"——加速器仍然会让 vCPU 跑。没有 `-kernel`
+时它从一片全零的 ROM 开始执行，几秒后必然撞进 HardFault。只要那一项不需要
+客户机执行任何指令（读寄存器、写显存、截图），就加 `-S` 把 CPU 冻住。
+第 6、8 项都是因为这个原因带 `-S`。
+
+**`screendump` 出的 PPM 行距不是 `宽 × 3`**。`ppm_save()`
+（`ui/ui-qmp-cmds.c:321`）每行写的是 `pixman_image_get_stride(linebuf)`，而那个
+`linebuf` 是 24bpp 的，pixman 会把行距按 4 字节对齐——390 像素时 1170 变成
+1172。**头里写的却还是 390 像素宽**，所以这个文件严格来说对不上标准，按
+`宽 × 3` 去解会从第二行起逐行错位。解的时候两个行距都试、以文件实际长度为准。
+
 **确认接口过滤逻辑**：
 ```bash
 sed -n '1113,1122p' qom/object.c
@@ -516,7 +561,7 @@ aarch64 那个二进制对这个项目没有用处——虽然它也能跑这块
 
 | 平台 | 要求 | 由什么决定 |
 |---|---|---|
-| Linux | **glibc ≥ 2.34**<br>（Ubuntu 21.10+ / Debian 12+ / RHEL 9+）<br>另需 `libglib2.0-0`、`libpixman-1-0`、`libpng16-16`、`zlib1g` | 产物里引用到的最高 `GLIBC_x.y` 符号（不是构建环境的版本）|
+| Linux | **glibc ≥ 2.34**<br>（Ubuntu 21.10+ / Debian 12+ / RHEL 9+）<br>另需 `libglib2.0-0`、`libpixman-1-0`、`libpng16-16`、`zlib1g`、`libsdl2-2.0-0` | 产物里引用到的最高 `GLIBC_x.y` 符号（不是构建环境的版本）|
 | macOS | **macOS ≥ 11**，**仅 arm64** | `MACOSX_DEPLOYMENT_TARGET=11.0`；架构取决于 runner |
 | Windows | Windows 10+，x86_64 | MSYS2 mingw64 自身的下限 |
 

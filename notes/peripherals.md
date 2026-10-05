@@ -495,9 +495,10 @@ HAL 的写法（`bf0_hal_epic.c:1897`、`:4025`）是：
 QSPI 模式），HAL 问的那些寄存器 RCC/MPI 那几张表已经在答了；固件认为它起来了
 之后，对这块内存做的事就是普通的 load/store。
 
-**`hello_world` 用不到它**：它的 `.RW_PSRAM_NON_RET` 段长度是 0，所以第 8 项检查
-从来没碰过 PSRAM。`example/hal/epic` 才是第一个真往里放东西的（0x868a0 字节的
-三个 buffer），加 PSRAM 就是为了让它能跑。
+**`hello_world` 用不到它**：它的 `.RW_PSRAM_NON_RET` 段长度是 0，所以第 9 项检查
+从来没碰过 PSRAM。`example/hal/rt_driver` 和 `example/hal/epic` 才是真往里放东西的
+（EPIC 的 0x868a0 字节三个 buffer；rt_driver 的 526500 字节显存），加 PSRAM 就是
+为了让它们能跑。
 
 ### 8.2 图层 `SRC` 和 `AHB_MEM` 不是一回事
 
@@ -541,8 +542,144 @@ QSPI 模式），HAL 问的那些寄存器 RCC/MPI 那几张表已经在答了�
 
 ---
 
+## 9. LCDC 与面板（显示）
 
-## 9. 加一个新外设
+`hw/display/sifli-lcdc.c`（控制器，machine 建，`0x50008000` / IRQ 63）+
+`hw/display/sifli-panel.c`（面板，`-device`）。画面直接进 QEMU 的显示控制台，
+`-display sdl` 就是屏幕。
+
+### 9.1 两条互不相干的路径
+
+```
+(a) 命令/读数路径  LCD_WR + LCD_SINGLE   —— 控制器跟**面板**说话，不碰内存
+(b) 帧路径         COMMAND.START         —— 控制器是 AHB 总线主控，自己取显存
+```
+
+**(b) 不经过我们的 DMA 模型**：LCDC 自己按 `LAYER0_SRC` 去 AHB 上取像素
+（`bf0_hal_lcdc.c:1692`），所以模型直接用 `dma_memory_read()` 读 guest 内存。
+这也是为什么刷屏链路完全不依赖 DMAC——调试时别往 DMA 那边找。
+
+### 9.2 帧路径
+
+固件侧 `LayerUpdate()` 配 `LAYER0_CONFIG`（源格式 + **字节**行距）、`LAYER0_SRC`、
+`TL/BR_POS`，然后 `COMMAND.START` 一写，硬件送完一整帧才置 `IRQ.EOF`。
+
+**`LAYER0_SRC` 指的是这一块自己的首像素，不是显存基址。** 取数地址是
+
+```
+SRC + (y - y0) * stride + (x - x0) * bytes_per_pixel
+```
+
+`TL/BR` 只决定画到屏幕哪儿。这条不是我猜的：`SetupLineIrq()`
+（`bf0_hal_lcdc.c:1150-1165`）为了用 bus monitor 抓住这一层的读，先把
+`data_area` 的角点减掉再算预期地址；`drv_lcd` 也是把脏矩形的首像素指针交给
+`LayerUpdate` 的（`drv_lcd.c:1503`、`:3290`）。**照基址去读会画出一片黑**，
+而且全屏刷新时两种解释恰好重合，所以只有部分刷新才暴露——写测试时专门验它。
+
+两个字段容易记反：
+
+| 字段 | 含义 |
+|---|---|
+| `LAYER0_CONFIG.WIDTH`（bit13，13 位） | **字节**行距，不是像素数（`:1661`） |
+| `LAYER0_SRC_ADDR_Pos` | **0**（`lcd_if.h:291`），所以寄存器里就是裸地址 |
+
+**源格式和输出格式是分开的**：`LAYER0_CONFIG.FORMAT` 是源（`drv_lcd` 按
+`RTGRAPHIC_CTRL_SET_BUF_FORMAT` 设成 RGB565/RGB888），面板侧输出由 `LCD_CONF`
+的 `SPI_LCD_FORMAT` 决定。转换是硬件做的，所以模型自己做 RGB888→RGB565。
+RGB888 在内存里是 **B,G,R**（小端），别按 R 开头解。
+
+**影子显存是必需的**，不是优化：LVGL 每次只送脏矩形，没有影子的话屏幕只会
+留下最后那一小块。推画面用 `qemu_create_displaysurface_from()` 零拷贝包一层
+（`ramfb.c` 的路子）+ `dpy_gfx_update_full()`，**不需要定时器**——UI 自己以
+30–60 Hz 轮询 `gfx_update`。
+
+**SBUS 别名要翻回来**：`LAYER0_SRC` 在 HAL 里过了一道 `HCPU_MPI_SBUS_ADDR()`
+（`bf0_hal_lcdc.c:1727`），显存落在 flash 时寄存器里拿到的是 `+0x50000000` 之后
+的地址。模型读 guest 走的是 CPU 视角的地址空间，所以取数前先过
+`sifli_sbus_to_cpu_addr()` —— 和 EPIC 的图层 `SRC` 是同一件事，窗口怎么划、
+那条 4 MB 边界为什么在那儿，见 §8.2、§8.3。PSRAM/SRAM 里的显存不在窗口内，
+原样通过，而这棵树里所有显存都在那儿。
+
+### 9.3 EOF 中断是命门，不是可选项
+
+驱动匹配上之后 `drv_lcd.assert_timeout = 1`，而 `draw_core` 里
+`rt_sem_take(&draw_sem, MAX_LCD_DRAW_TIME)` 一超时就 `RT_ASSERT(0)`
+（`drv_lcd.c:1728-1736`）。而放行这个信号量的正是 EOF：
+
+```
+IRQ.EOF → HAL_LCDC_IRQHandler → LCDC_TransCpltCallback → SendLayerDataCpltCbk
+        → rt_sem_release(&draw_sem)
+```
+
+所以模型不能"把 START 收下就算了"——**必须在写 START 时就把整帧做完并置 EOF**，
+固件才不会被断言打死。`IRQ` 是**写 1 清**、不是读清：HAL 既裸轮询它
+（`bf0_hal_lcdc.c:2026`）又把读到的值写回去清（`:5784`），读清会让轮询死循环。
+
+固件会等的两个 BUSY 位（`STATUS.LCD_BUSY`、`LCD_SINGLE.LCD_BUSY`）**恒读 0**，
+`WaitBusy()` 和 `WAIT_LCDC_SINGLE_BUSY()` 第一次判断就过，不必跑满超时。
+
+### 9.4 面板为什么做成 `-device`
+
+不同板子接不同型号的屏，**ID 和分辨率都不一样**，而在设备里硬编码就不是
+"换命令行就能换屏"了：
+
+```bash
+-device sifli-panel                                   # 默认就是 a128r16 的 CO5300
+-device sifli-panel,id=0x60834200,width=480,height=272
+```
+
+**面板比 LCDC 晚 realize，所以只能由面板反向注册。** `-device` 的处理在
+`machine_run_board_init()` **之后**（`system/vl.c:2751` vs `:2716`），LCDC 在
+自己 realize 时看不到面板。于是面板 realize 里反过来调
+`sifli_lcdc_set_panel()`，把尺寸带过去。
+
+**分辨率只能由面板给**：`LCD_CONF` 只有格式/接口字段、没有分辨率；
+`CANVAS_TL/BR_POS` 写的是刷新脏矩形，不是屏的物理尺寸。忘了 `-device` 的话
+模型打 `LOG_GUEST_ERROR`（带 "pass -device sifli-panel"），固件自己也会打
+`unknow lcd!`，屏幕黑但不崩——两条都值得留痕。
+
+面板侧**不建模 QSPI 协议、不建模命令序列、不建模面板 GRAM**：初始化的那一长串
+`LCD_WriteReg` 收下丢掉，QEMU 控制台的 surface 就是 GRAM。
+
+### 9.5 读数路径：面板对固件唯一要回答的问题
+
+固件只是问"你是谁"。这一路要看清楚**模型怎么知道固件在读哪个寄存器**：
+
+```
+co5300.c:291   LCD_ReadID()  → LCD_ReadData(hlcdc, 0x04, 3)
+co5300.c:415   LCD_ReadData()→ HAL_LCDC_ReadU32Reg(hlcdc, (0x03<<24)|(0x04<<8), buf, 3)
+bf0_hal_lcdc.c:2793  HAL_LCDC_ReadDatas()  ── SPI 分支 ──
+    清 SPI_IF_CONF.SPI_CS_AUTO_DIS(bit27)   ← 事务开始
+    SendSingleCmd(addr, 4)                  → LCD_WR = 命令字
+                                            → SPI_IF_CONF.WR_LEN = 3
+                                            → LCD_SINGLE = WR_TRIG(bit1)
+    置 bit27；SPI_IF_CONF ← RD_LEN=2
+    LCD_SINGLE = TYPE|RD_TRIG(bit0|bit2)    ← 面板此刻把 3 字节摆上总线
+    data = LCD_RD   → 按小端拆成 3 字节
+```
+
+两个关键点：
+
+1. **读发生时 `LCD_WR` 里还留着命令字**（`SendSingleCmd` 先写 `LCD_WR` 再写
+   `LCD_SINGLE`，中间没人碰）。所以模型能看见在读哪个寄存器：
+   `reg = (cmd_word >> 8) & 0xffff`。字节数不在命令字里，在 `SPI_IF_CONF.RD_LEN`。
+2. **`SendSingleCmd` 在 `bytes_gap_us > 0` 时逐字节写 `LCD_WR`**，那时只留最后
+   一字节。所以模型盯 `SPI_CS_AUTO_DIS` 的 1→0 边沿重置累加器，并在
+   `WR_LEN == 0` 时把字节左移拼起来。CO5300 走整字路径，但别的屏不一定。
+
+**为什么"寄存器 → ID"就够覆盖所有能选的屏**：把 SDK 里 ~48 个面板驱动的
+`ReadID` 过了一遍，这个 SoC 上能选的 SPI/QADSPI 屏只有两种写法——直接返回
+寄存器读到的值（CO5300、ST7789H2），或返回驱动里写死的常量（GC9A01A、GC9107、
+NV3041A、SH8603B、SPD2012、FT2308…）。两种情况下"面板返回自己的 ID"都是对的。
+（例外是 ST7789V 那种对读到的值做位运算的，它在本 SoC 上不可选。）
+
+⚠️ a128r16 这块屏的 ID 是 **`0x331100`**，不是 `0x530001`：`co5300.c:45-56` 按
+模组挑 ID，`AM196Q…`/`H0198S…` 一个都没定义，于是落到 `#else` 分支。模型不能
+偷懒——读回的 3 字节必须真的是 `0x331100`。
+
+---
+
+## 10. 加一个新外设
 
 **纯配置的（GPIO 配置、PINMUX、LPSYS_CFG…）**：
 1. 在 `sf32lb52x-periph.c` 里加一张 `SifliRegDef[]` 表
@@ -560,7 +697,7 @@ QSPI 模式），HAL 问的那些寄存器 RCC/MPI 那几张表已经在答了�
 
 ---
 
-## 10. 真实固件 bring-up 记录
+## 11. 真实固件 bring-up 记录
 
 用 `sf32lb52-lcd_a128r16` 的 `hello_world`（SDK 原样构建，固件一行不改）逐个
 排查出来的。**这些用 `hello_qemu` 那种 semihosting 桩永远发现不了**——它一个
@@ -569,7 +706,7 @@ HAL 寄存器都不碰。
 排查手法：固件跑起来后从 monitor 采 `info registers` 看 PC，两次采样相同就是
 死循环，再用 `arm-none-eabi-addr2line` 把地址翻回源码行。
 
-### 10.1 DWT 周期计数器（QEMU 的缺口）
+### 11.1 DWT 周期计数器（QEMU 的缺口）
 
 PC 停在 `HAL_Delay_us_`（`bf0_hal.c:407`）：
 
@@ -585,9 +722,9 @@ bcc.n ...
 `HAL_RCC_HCPU_ConfigHCLK(240)` → `EnableDLL1` → `HAL_Delay_us(10)`。
 
 补了 `hw/misc/armv7m_dwt.c`（和 `armv7m_ras.c` 并列，同挂 `CONFIG_ARM_V7M`）。
-见 §10.2 关于它为什么必须挂进 armv7m 的 container。
+见 §11.2 关于它为什么必须挂进 armv7m 的 container。
 
-### 10.2 armv7m container 的优先级陷阱
+### 11.2 armv7m container 的优先级陷阱
 
 把 DWT 映射进 board 的 system memory **不生效**，尽管 `info mtree -f` 里能看到它：
 
@@ -613,7 +750,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 **教训**：`info mtree` 会把重叠的两段都列出来，光看它会被骗。要确认一个
 区域真的生效，得实际读写它。
 
-### 10.3 RTC 的 LXT 使能位（分支走错）
+### 11.3 RTC 的 LXT 使能位（分支走错）
 
 越过 DWT 后卡在 `bf0_hal_lrc_cal.c:894`，轮询 BT MAC 的 `RCCAL_RESULT`。
 
@@ -631,7 +768,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 把 RTC 块建起来让这一位存住即可，**比为了这一位去建模 BT MAC 便宜得多**，
 也更接近真实板子（板上有 LXT 晶振）。
 
-### 10.4 MPI 的 CALCR.DONE
+### 11.4 MPI 的 CALCR.DONE
 
 `HAL_MPI_OPSRAM_CAL_DELAY`（`bf0_hal_mpi_psram.c:1386`）：写 `CALCR.EN`(bit31)
 启动校准，然后轮询 `CALCR.DONE`(bit8)。和 RCC 的 `HRCCAL1.CAL_DONE` 同型
@@ -646,7 +783,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 | `SR.BUSY` bit31 | 忙 | `HAL_FLASH_IS_BUSY()` |
 | `CALCR.DONE` bit8 | 校准完成 | `bf0_hal_mpi_psram.c:1386` |
 
-### 10.5 RTC_ISR 的六个就绪标志
+### 11.5 RTC_ISR 的六个就绪标志
 
 `RTC_EnterInitMode`（`bf0_hal_rtc.c:1009`）置 `ISR.INIT`(bit10) 后等
 `ISR.INITF`(bit9)。把 `bf0_hal_rtc.c` 里所有 `while` 找出来后发现有六个
@@ -667,7 +804,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 才知道那个分支被 `if (hrtc->Instance->CR & RTC_CR_WUTE)` 保护着，而 WUTE 我们
 从不置位，所以强制置 1 是安全的。**这类冲突必须读代码，猜不出来。**
 
-### 10.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
+### 11.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
 
 音频这块**故意只建了极少的寄存器**，其余留白：
 
@@ -695,7 +832,7 @@ pll_cnt = PLL_CAL_RESULT >> PLL_CNT_Pos;
 
 **先判断循环是否本身有界，再决定要不要伪造终态。**
 
-### 10.7 结果
+### 11.7 结果
 
 `sf32lb52-lcd_a128r16` 的 `hello_world`，SDK 原样构建、一行不改：
 
@@ -713,10 +850,10 @@ Hello world3!
 msh />
 ```
 
-跑到 `main()` 并停在 RT-Thread 的 msh 提示符上。`notes/verify-sifli.sh` 第 8 项
+跑到 `main()` 并停在 RT-Thread 的 msh 提示符上。`notes/verify-sifli.sh` 第 9 项
 就是跑这个。
 
-### 10.8 规律
+### 11.8 规律
 
 到目前为止**每一个坑都是同一个形状**：没建模的寄存器读回 0，固件据此做了
 一个真实硬件上不会做的判断，然后走进死循环或错误分支。所以薄模型的重点
@@ -724,7 +861,7 @@ msh />
 
 ---
 
-## 11. 排查
+## 12. 排查
 
 **看固件碰了哪些没建模的地址**：
 
@@ -749,7 +886,7 @@ create_unimplemented_device("sifli.xxx", BASE, SIZE);   /* 需要 hw/misc/unimp.
 
 应能看到 `sf32lb52x.hpsys_rcc`、`sf32lb52x.pmuc`、`sifli-usart`、`sifli-dma`
 等区域。
-`notes/verify-sifli.sh` 的第 7 项就是自动做这件事。
+`notes/verify-sifli.sh` 的第 6 项就是自动做这件事。
 
 **加一个没被强制但固件在等的位**：直接 grep HAL：
 

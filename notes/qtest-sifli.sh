@@ -36,6 +36,14 @@ run() {
               -serial none -qtest stdio 2>/dev/null | tr -d '\r'
 }
 
+# 面板是 -device 加进来的，所以要单独起一次机器。设备在 machine init 之后
+# 才建，面板 realize 时把自己反向注册给 LCDC 的 QSPI 总线。
+run_panel() {
+    printf '%s\n' "$@" quit \
+        | timeout 30 "$QEMU" -M sf32lb52x -display none \
+              -serial none -device sifli-panel -qtest stdio 2>/dev/null | tr -d '\r'
+}
+
 out=$(run \
     'writel 0x50000010 0x10' \
     'readl 0x50000008' \
@@ -348,6 +356,80 @@ else
         fi
     fi
 fi
+
+echo
+echo "[10] LCDC：命令路径（控制器问面板「你是谁」）"
+# 这一串完全照抄 co5300.c 的 LCD_ReadID()：
+#   LCD_ReadMode(true)        SPI_IF_CONF 分频
+#   HAL_LCDC_SPI_Sequence(0)  SPI_CS_AUTO_DIS(bit27) 落沿 = 一次事务开始
+#   SendSingleCmd(0x03000400, 4)
+#                             SPI_IF_CONF.WR_LEN = 3（addr_len-1），
+#                             LCD_WR = 命令字，LCD_SINGLE = WR_TRIG
+#   HAL_LCDC_SPI_Sequence(1)  置回 bit27
+#   SPI_IF_CONF ← RD_LEN=2 | SPI_RD_MODE，LCD_SINGLE = RD_TRIG
+#   data = LCD_RD             面板此刻把 3 字节摆在总线上
+# 注意命令字里的 0x03 不是长度：HAL_LCDC_ReadU32Reg 是宏，addr_len 恒为 4，
+# 要读几个字节写在 SPI_IF_CONF.RD_LEN 里。寄存器号在 (cmd >> 8) & 0xffff。
+out=$(run_panel \
+    'writel 0x5000809c 0x00000000' \
+    'writel 0x5000809c 0x00c00000' \
+    'writel 0x50008094 0x03000400' \
+    'writel 0x50008090 0x00000002' \
+    'writel 0x5000809c 0x09200000' \
+    'writel 0x50008090 0x00000005' \
+    'readl 0x50008098' \
+    'readl 0x50008004' \
+    'readl 0x50008090' \
+    'writel 0x5000809c 0x00000000' \
+    'writel 0x5000809c 0x00c00000' \
+    'writel 0x50008094 0x03000a00' \
+    'writel 0x50008090 0x00000002' \
+    'writel 0x5000809c 0x09200000' \
+    'writel 0x50008090 0x00000005' \
+    'readl 0x50008098')
+vals=$(echo "$out" | grep '^OK 0x')
+i=0
+check 0x331100 "读 LCD_RD 拿到 a128r16 的 CO5300 面板 ID"
+check 0x0      "STATUS 恒不 busy（WaitBusy 不会超时）"
+check 0x0      "LCD_SINGLE 恒不 busy（WAIT_LCDC_SINGLE_BUSY 同理）"
+check 0x0      "读面板上不存在的寄存器 0x0A 回 0"
+
+echo
+echo "[11] LCDC：帧路径（COMMAND.START 就地出帧）"
+# 2x1 的 RGB565 图案放在 SRAM 里，LAYER0_SRC 指过去。LAYER0_CONFIG.WIDTH
+# 是**字节**行距（LayerUpdate 把 layer_1line_total_bytes 移进去），不是像素数。
+# HAL 的顺序是先把 EOF 中断解除屏蔽，再 START。
+out=$(run_panel \
+    'writel 0x20000000 0x001f001f' \
+    'writel 0x5000801c 0x10008000' \
+    'writel 0x50008020 0x00000000' \
+    'writel 0x50008024 0x00000001' \
+    'writel 0x5000802c 0x20000000' \
+    'writel 0x50008080 0x00000400' \
+    'writel 0x5000800c 0x00000001' \
+    'writel 0x50008000 0x00000001' \
+    'readl 0x50008008' \
+    'writel 0x50008008 0x00010001' \
+    'readl 0x50008008')
+vals=$(echo "$out" | grep '^OK 0x')
+i=0
+# SETTING 里 EOF 已解除屏蔽，所以 STAT(bit0) 和 RAW(bit16) 一起置起来。
+check 0x10001 "START 后 IRQ 置 EOF_STAT|EOF_RAW"
+check 0x0     "写 1 清后 IRQ 读回 0"
+
+echo
+echo "[12] LCDC：忘了 -device sifli-panel 时不崩，只是读回 0"
+out=$(run \
+    'writel 0x5000809c 0x00000000' \
+    'writel 0x5000809c 0x00c00000' \
+    'writel 0x50008094 0x03000400' \
+    'writel 0x50008090 0x00000002' \
+    'writel 0x5000809c 0x09200000' \
+    'writel 0x50008090 0x00000005' \
+    'readl 0x50008098')
+vals=$(echo "$out" | grep '^OK 0x')
+i=0
+check 0x0 "没有面板时读数路径回 0"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

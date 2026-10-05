@@ -71,7 +71,11 @@ hw/display/sifli-ezip.c
 include/hw/display/sifli-ezip.h
 include/hw/misc/sifli-sbus.h
 hw/misc/sifli-regbank.c
-include/hw/misc/sifli-regbank.h"
+include/hw/misc/sifli-regbank.h
+hw/display/sifli-lcdc.c
+include/hw/display/sifli-lcdc.h
+hw/display/sifli-panel.c
+include/hw/display/sifli-panel.h"
 
 if [ -f "$SRC/scripts/checkpatch.pl" ]; then
     for f in $NEW_FILES; do
@@ -96,7 +100,8 @@ echo
 
 # --------------------------------------------------------------- 4. 行尾
 echo "[4] 工作区行尾（应为 LF）"
-if [ -d "$SRC/.git" ]; then
+# -e 而不是 -d：在 git worktree 里 .git 是个指向主仓库的文件，git 命令照样能用。
+if [ -e "$SRC/.git" ]; then
     bad=$(cd "$SRC" && git ls-files --eol \
               $NEW_FILES \
               hw/arm/Kconfig hw/arm/meson.build \
@@ -119,7 +124,7 @@ echo
 
 # ----------------------------------------------------------- 5. 提交完整性
 echo "[5] 提交完整性"
-if [ -d "$SRC/.git" ]; then
+if [ -e "$SRC/.git" ]; then
     last=$(cd "$SRC" && git log -1 --format=%B)
     author=$(cd "$SRC" && git log -1 --format='%an <%ae>')
     sob=$(echo "$last" | grep -m1 '^Signed-off-by:' | sed 's/^Signed-off-by: *//')
@@ -157,6 +162,9 @@ xp /1wx 0x500c0010
 xp /1wx 0x500c002c
 xp /1wx 0x500ca01c
 xp /1wx 0x500ca020
+xp /1wx 0x50008004
+xp /1wx 0x50008008
+xp /1wx 0x50008090
 EOF
 )
     probe=$(printf '%s\nquit\n' "$probe_in" \
@@ -191,6 +199,21 @@ EOF
 50007000 sifli-epic EPIC
 EOF
 
+        # 地址 region名 说明。PSRAM 必须真的是块 RAM 而不是落到
+        # ignore_memory_transaction_failures 的兜底上——固件的 514 KiB 显存
+        # 在 0x60400000，两种情况下读写都不报错、读回都是 0，只有 mtree 分得清。
+        while read -r a name what; do
+            [ -n "$a" ] || continue
+            if echo "$probe" | grep -q "$a-.*$name"; then
+                pass "$what 已映射（$a → $name）"
+            else
+                fail "$what 不在 info mtree 里（$a → $name）"
+            fi
+        done <<'EOF'
+50008000 sifli-lcdc  LCDC1
+60000000 sifli.psram PSRAM
+EOF
+
         # 地址 期望值 说明
         while read -r addr want what; do
             [ -n "$addr" ] || continue
@@ -214,6 +237,9 @@ EOF
 5008401c 0x000000c0 USART1.ISR TXE|TC 恒置
 50006000 0x00000000 EZIP1.CTRL 复位后为 0（弱检查，写路径在 qtest 里）
 50007000 0x00000000 EPIC.COMMAND 复位后为 0（同上）
+50008004 0x00000000 LCDC.STATUS 不 busy
+50008008 0x00000000 LCDC.IRQ 无未决 EOF
+50008090 0x00000000 LCDC.LCD_SINGLE 不 busy
 EOF
     fi
 fi
@@ -234,11 +260,203 @@ else
 fi
 echo
 
-# ------------------------------------------------------- 8. 真实板子固件
+# --------------------------------------------------------------- 8. 画面
+# 前面几项只证明寄存器读写对；这一项证明**像素真的出去了**：qtest 在显存里
+# 放一块已知颜色、START、然后让 monitor 截图，再解 PPM 断言具体像素和尺寸。
+#
+# 不需要 SDL，也不需要固件。ui/console.c 是无条件编进 system_ss 的，而且
+# dpy_gfx_replace_surface() 不管有没有显示后端都会把 surface 存进 con->surface
+# （ui/console.c:837），所以 -display none 下 screendump 照样有东西可截。
+# 也就是说这一项在没有 SDL 的构建和 CI 上都要能过。
+#
+# qtest 和 monitor 各要一条输入通道，所以 qtest 仍走 stdio（配 FIFO，和第 9 项
+# 同一个写法），monitor 另开一条 unix socket —— 只为了发一句 screendump。
+echo "[8] 画面输出（qtest 写显存 + screendump 截图）"
+if [ ! -x "$BUILD/qemu-system-arm" ]; then
+    skip "二进制不存在"
+elif ! command -v nc >/dev/null 2>&1 || ! nc -h 2>&1 | grep -q -- '-U'; then
+    skip "没有支持 -U 的 nc，发不了 screendump 给 monitor"
+elif ! command -v python3 >/dev/null 2>&1; then
+    skip "没有 python3，解不了 PPM"
+else
+    fifo=$(mktemp -u)
+    sock=$(mktemp -u)
+    log=$(mktemp)
+    ppm=$(mktemp -u).ppm
+    mkfifo "$fifo"
+
+    # -S 是必须的：qtest 加速器下 vCPU 仍然会跑，而这里没有 -kernel，CPU 从
+    # 一片全零的 ROM 开始执行，几秒后必然撞进 HardFault 把 QEMU 打死
+    # （qemu: fatal: Lockup: can't escalate 3 to HardFault）。这一项要的只是
+    # 寄存器写和截图，不需要客户机执行任何指令。
+    exec 3<>"$fifo"
+    timeout 60 "$BUILD/qemu-system-arm" -M sf32lb52x \
+        -display none -serial none -device sifli-panel -S \
+        -qtest stdio -monitor unix:$sock,server=on,wait=off \
+        < "$fifo" > "$log" 2>&1 &
+    qpid=$!
+
+    for _ in $(seq 1 100); do
+        [ -S "$sock" ] && break
+        kill -0 "$qpid" 2>/dev/null || break
+        sleep 0.1
+    done
+
+    # 等第 n 次 START 的回读出现。不等的话截到的可能是画之前的那一帧 ——
+    # qtest 是异步收命令的，写完就截图会和 START 抢。
+    wait_eof() {
+        for _ in $(seq 1 100); do
+            [ "$(grep -c '^OK 0x10001' "$log" 2>/dev/null)" -ge "$1" ] \
+                && return 0
+            kill -0 "$qpid" 2>/dev/null || return 1
+            sleep 0.1
+        done
+        return 1
+    }
+
+    # 第一帧：2x1 的纯红（RGB565 0xF800）画在 (10,20)。LAYER0_CONFIG.WIDTH 是
+    # **字节**行距（2 像素 × 2 字节 = 4），所以是 4 << 13；LCD_CONF 的
+    # SPI_LCD_FORMAT 写 1（bit10）表示面板侧 RGB565。SRC 指向这一块的首像素
+    # （见下一帧的说明），这里它正好就是 0x20000000，所以图案也放这儿。
+    printf '%s\n' \
+        'writel 0x20000000 0xf800f800' \
+        'writel 0x5000801c 0x10008000' \
+        'writel 0x50008020 0x0014000a' \
+        'writel 0x50008024 0x0014000b' \
+        'writel 0x5000802c 0x20000000' \
+        'writel 0x50008080 0x00000400' \
+        'writel 0x5000800c 0x00000001' \
+        'writel 0x50008000 0x00000001' \
+        'readl 0x50008008' >&3
+    wait_eof 1
+
+    # 第二帧走 rt_driver 那条路：RGB888 源、显存在 PSRAM、行距 390×3 = 1170
+    # 字节、一个像素画在 (100,50)。验收固件正是这么配的，先把这条几何验掉，
+    # 免得等固件编出来才发现转换或 PSRAM 取数是错的。
+    #
+    # LAYER0_SRC 给的是**这一块自己的首像素**（0x60400000 + 50×1170 + 100×3），
+    # 不是显存基址：硬件从 SRC 起按相对坐标寻址，TL/BR 只决定画到屏幕哪儿。
+    # SDK 就是这么算的——SetupLineIrq()（bf0_hal_lcdc.c:1150-1165）先把
+    # data_area 的角点减掉，再去预测 LCDC 会读哪个地址；drv_lcd 也是把脏矩形
+    # 的首像素指针交给 LayerUpdate 的（drv_lcd.c:1503、:3290）。给成基址的话
+    # 模型会老老实实从基址读，画出来一片黑。
+    #
+    # 颜色特意选**纯蓝**：RGB888 在内存里是 B,G,R，所以字节是 FF,00,00。
+    # 要是模型把字节序弄反了，读出来就是纯红，(10,20) 那块也是红的，一眼可见。
+    printf '%s\n' \
+        'writel 0x50008008 0x00010001' \
+        'writeb 0x6040e5b0 0xff' \
+        'writeb 0x6040e5b1 0x00' \
+        'writeb 0x6040e5b2 0x00' \
+        'writel 0x5000801c 0x10924001' \
+        'writel 0x50008020 0x00320064' \
+        'writel 0x50008024 0x00320064' \
+        'writel 0x5000802c 0x6040e5b0' \
+        'writel 0x50008000 0x00000001' \
+        'readl 0x50008008' >&3
+    wait_eof 2
+
+    printf 'screendump %s\n' "$ppm" \
+        | timeout 10 nc -U -q 1 "$sock" >/dev/null 2>&1
+    for _ in $(seq 1 50); do
+        [ -s "$ppm" ] && break
+        sleep 0.1
+    done
+
+    kill "$qpid" 2>/dev/null
+    wait "$qpid" 2>/dev/null
+    exec 3>&-
+    rm -f "$fifo" "$sock"
+
+    if [ ! -s "$ppm" ]; then
+        fail "screendump 没产出文件"
+        sed 's/^/         /' "$log" | tail -6
+    else
+        # P6 的头是变长的（还可能夹注释），所以按 token 解而不是按行。
+        # 期望：面板给的 390x450；第一帧画的红块还在（影子显存把两帧叠起来了，
+        # 不是每帧清屏）；第二帧那个 RGB888 像素是**蓝**不是红（字节序对了）；
+        # 没画到的角落是黑（影子建的时候清过零，所以"只有那两块被画上去"
+        # 这件事也一起验了）。
+        bad=$(python3 - "$ppm" <<'PY' 2>&1
+import sys
+
+raw = open(sys.argv[1], 'rb').read()
+if raw[:2] != b'P6':
+    print('不是 P6 PPM（头是 %r）' % raw[:2])
+    sys.exit(0)
+
+i, tok = 2, []
+while len(tok) < 3:
+    while raw[i:i + 1] and raw[i:i + 1].isspace():
+        i += 1
+    if raw[i:i + 1] == b'#':
+        while raw[i:i + 1] and raw[i:i + 1] != b'\n':
+            i += 1
+        continue
+    j = i
+    while raw[j:j + 1] and not raw[j:j + 1].isspace():
+        j += 1
+    if j == i:
+        print('PPM 头解析失败')
+        sys.exit(0)
+    tok.append(int(raw[i:j]))
+    i = j
+i += 1
+w, h = tok[0], tok[1]
+
+# 行距不是 w*3。ppm_save()（ui/ui-qmp-cmds.c:321）每行写的是
+# pixman_image_get_stride(linebuf)，而那个 linebuf 是 24bpp 的，pixman 会把
+# 行距按 4 字节对齐 —— 390 像素时 1170 变成 1172。头里写的还是 390 像素宽，
+# 所以这个 PPM 严格来说对不上，按 w*3 去解会逐行错位。两个都试，以文件实际
+# 长度为准，这样上游哪天改成紧凑排布也不会挂。
+tight, aligned = w * 3, (w * 3 + 3) & ~3
+if len(raw) - i == tight * h:
+    pitch = tight
+elif len(raw) - i == aligned * h:
+    pitch = aligned
+else:
+    print('数据长度 %d 既不是 %d 也不是 %d' % (len(raw) - i, tight * h, aligned * h))
+    sys.exit(0)
+
+def px(x, y):
+    o = i + y * pitch + x * 3
+    return tuple(raw[o:o + 3])
+
+if (w, h) != (390, 450):
+    print('尺寸是 %dx%d，期望 390x450（面板给的）' % (w, h))
+elif px(10, 20) != (255, 0, 0):
+    print('(10,20) 是 %s，期望红 (255,0,0)' % (px(10, 20),))
+elif px(11, 20) != (255, 0, 0):
+    print('(11,20) 是 %s，期望红 (255,0,0)' % (px(11, 20),))
+elif px(12, 20) != (0, 0, 0) or px(10, 21) != (0, 0, 0):
+    print('(12,20)/(10,21) 是 %s/%s，期望黑（只该画 2x1 那一块）'
+          % (px(12, 20), px(10, 21)))
+elif px(100, 50) != (0, 0, 255):
+    print('(100,50) 是 %s，期望蓝 (0,0,255)——RGB888 的 B,G,R 字节序，'
+          '以及从 PSRAM 取数' % (px(100, 50),))
+elif px(0, 0) != (0, 0, 0):
+    print('(0,0) 是 %s，期望黑（没画到的地方）' % (px(0, 0),))
+elif px(389, 449) != (0, 0, 0):
+    print('(389,449) 是 %s，期望黑（没画到的地方）' % (px(389, 449),))
+PY
+)
+        rm -f "$ppm"
+        if [ -z "$bad" ]; then
+            pass "390x450；RGB565 红块与 PSRAM 里 RGB888 蓝点各就各位，未画处黑"
+        else
+            fail "截图像素不对：$bad"
+            sed 's/^/         /' "$log" | tail -6
+        fi
+    fi
+    rm -f "$log"
+fi
+echo
+
+# ------------------------------------------------------- 9. 真实板子固件
 # 这一项才是真正的验收。
 #
 # 第 6、7 项只是结构性地读几个寄存器，模型写错了它们照样能过
-# （peripherals.md §10.2 那个 DWT 映射错位的坑就骗过了它们全部）。只有这里
+# （peripherals.md §11.2 那个 DWT 映射错位的坑就骗过了它们全部）。只有这里
 # ——SDK 原样构建的真实板子固件、一行不改——能证明整个 HAL 真的在模型上跑
 # 起来了：时钟树、电源、RTC、MPI、音频、控制台，一路到 main() 和 RT-Thread
 # 的 shell。
@@ -251,7 +469,7 @@ echo
 # 固件用 scons 构建：
 #   cd <SDK>/example/get-started/hello_world/rtt/project
 #   scons --board=sf32lb52-lcd_a128r16_hcpu -j8
-echo "[8] 真实板子固件（sf32lb52-lcd_a128r16 hello_world）"
+echo "[9] 真实板子固件（sf32lb52-lcd_a128r16 hello_world）"
 REAL_FW=${SIFLI_REAL_FW:-/mnt/e/code2/SiFli-SDK/example/get-started/hello_world/rtt/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf}
 if [ "$REAL_FW" = "-" ]; then
     skip "按要求跳过"
@@ -319,8 +537,8 @@ else
 fi
 echo
 
-# ----------------------------------------------------- 9. 真实板子固件：EZIP
-# 第 8 项证明固件能跑起来，这一项证明它**跑出了正确结果**。
+# ---------------------------------------------------- 10. 真实板子固件：EZIP
+# 第 9 项证明固件能跑起来，这一项证明它**跑出了正确结果**。
 #
 # example/hal/ezip 自带测试向量和期望资产：main() 依次跑 EZIP 私有格式（轮询）、
 # EZIP 私有格式（中断）、LZ4、GZIP，每一条都把解出来的缓冲和期望资产整个
@@ -339,7 +557,7 @@ echo
 # 构建：
 #   cd <SDK>/example/hal/ezip/project
 #   scons --board=sf32lb52-lcd_a128r16_hcpu -j8
-echo "[9] 真实板子固件（sf32lb52-lcd_a128r16 ezip）"
+echo "[10] 真实板子固件（sf32lb52-lcd_a128r16 ezip）"
 EZIP_FW=${SIFLI_EZIP_FW:-/mnt/e/code2/SiFli-SDK/example/hal/ezip/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf}
 EZIP_TOOL=${SIFLI_EZIP_TOOL:-/mnt/e/code2/SiFli-SDK/tools/png2ezip/ezip_linux}
 if [ "$EZIP_FW" = "-" ]; then
@@ -352,7 +570,7 @@ else
     fifo=$(mktemp -u)
     log=$(mktemp)
     mkfifo "$fifo"
-    # 和第 8 项一样：让 stdin 那头一直是开着的，免得 chardev 在 EOF 上被摘掉。
+    # 和第 9 项一样：让 stdin 那头一直是开着的，免得 chardev 在 EOF 上被摘掉。
     exec 3<>"$fifo"
     timeout 120 "$BUILD/qemu-system-arm" -M "sf32lb52x,ezip-tool=$EZIP_TOOL" \
         -display none -serial stdio -monitor none \
@@ -385,8 +603,8 @@ else
 fi
 echo
 
-# ----------------------------------------------------- 10. 真实板子固件：EPIC
-# 第 8 项证明固件能跑起来，第 9 项证明解压的解对了，这一项证明**画出来的像素
+# ---------------------------------------------------- 11. 真实板子固件：EPIC
+# 第 9 项证明固件能跑起来，第 10 项证明解压的解对了，这一项证明**画出来的像素
 # 对了** —— 而且是 SDK 原样的例程、原样的 EPIC HAL 调用序列。
 #
 # example/hal/epic 的两级 alpha 混合（前景蓝 150x100 @(50,50)，背景红
@@ -406,7 +624,7 @@ echo
 # 构建：
 #   cd <SDK>/example/hal/epic/project
 #   scons --board=sf32lb52-lcd_a128r16_hcpu -j8
-echo "[10] 真实板子固件（sf32lb52-lcd_a128r16 epic）"
+echo "[11] 真实板子固件（sf32lb52-lcd_a128r16 epic）"
 EPIC_FW=${SIFLI_EPIC_FW:-/mnt/e/code2/SiFli-SDK/example/hal/epic/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf}
 ARM_NM=${SIFLI_ARM_NM:-arm-none-eabi-nm}
 if [ "$EPIC_FW" = "-" ]; then
