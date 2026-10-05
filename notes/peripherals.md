@@ -496,9 +496,9 @@ QSPI 模式），HAL 问的那些寄存器 RCC/MPI 那几张表已经在答了�
 之后，对这块内存做的事就是普通的 load/store。
 
 **`hello_world` 用不到它**：它的 `.RW_PSRAM_NON_RET` 段长度是 0，所以第 9 项检查
-从来没碰过 PSRAM。`example/hal/rt_driver` 和 `example/hal/epic` 才是真往里放东西的
-（EPIC 的 0x868a0 字节三个 buffer；rt_driver 的 526500 字节显存），加 PSRAM 就是
-为了让它们能跑。
+从来没碰过 PSRAM。`example/rt_driver` 和 `example/hal/epic` 才是真往里放东西的
+（EPIC 的 0x868a0 字节三个 buffer；rt_driver 的 351000 字节显存 = 390×450×2，
+RGB565），加 PSRAM 就是为了让它们能跑。
 
 ### 8.2 图层 `SRC` 和 `AHB_MEM` 不是一回事
 
