@@ -108,6 +108,7 @@ config SIFLI_SF32LB52X
     select SIFLI_USART
     select SIFLI_DMA
     select SIFLI_REGBANK
+    select SIFLI_EZIP
 
 config MPS3R
     bool
