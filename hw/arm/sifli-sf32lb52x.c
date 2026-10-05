@@ -33,6 +33,8 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/sf32lb52x.h"
 #include "hw/char/sifli-usart.h"
+#include "hw/display/sifli-epic.h"
+#include "hw/display/sifli-ezip.h"
 #include "hw/dma/sifli-dma.h"
 #include "hw/misc/armv7m_dwt.h"
 #include "hw/misc/sifli-regbank.h"
@@ -48,12 +50,23 @@ struct Sifli52xMachineState {
     ARMv7MState armv7m;
     MemoryRegion flash;
     MemoryRegion sram;
+    MemoryRegion psram;
 
     Clock *sysclk;
 
     /* Boot flash window; depends on the part number. */
     uint32_t flash_base;
     uint32_t flash_size;
+
+    /* Off-chip PSRAM, on MPI1. */
+    uint32_t psram_size;
+
+    /*
+     * Path to the vendor's ezip decoder, handed to the EZIP model. Only the
+     * proprietary bitstream needs it: it is the one format with no open
+     * decoder, and the tool lives in the SDK, wherever that was unpacked.
+     */
+    char *ezip_tool;
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(Sifli52xMachineState, SIFLI_SF32LB52X_MACHINE)
@@ -68,6 +81,7 @@ static void sifli_machine_instance_init(Object *obj)
      */
     s->flash_base = SF32LB52X_QSPI1_MEM_BASE;
     s->flash_size = SF32LB52X_FLASH_SIZE;
+    s->psram_size = SF32LB52X_PSRAM_SIZE;
 }
 
 static void sifli_get_flash_base(Object *obj, Visitor *v, const char *name,
@@ -112,6 +126,42 @@ static void sifli_set_flash_size(Object *obj, Visitor *v, const char *name,
     s->flash_size = value;
 }
 
+static void sifli_get_psram_size(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    Sifli52xMachineState *s = SIFLI_SF32LB52X_MACHINE(obj);
+    uint32_t value = s->psram_size;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void sifli_set_psram_size(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    Sifli52xMachineState *s = SIFLI_SF32LB52X_MACHINE(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    s->psram_size = value;
+}
+
+static char *sifli_get_ezip_tool(Object *obj, Error **errp)
+{
+    Sifli52xMachineState *s = SIFLI_SF32LB52X_MACHINE(obj);
+
+    return g_strdup(s->ezip_tool);
+}
+
+static void sifli_set_ezip_tool(Object *obj, const char *value, Error **errp)
+{
+    Sifli52xMachineState *s = SIFLI_SF32LB52X_MACHINE(obj);
+
+    g_free(s->ezip_tool);
+    s->ezip_tool = g_strdup(value);
+}
+
 static void sifli_sf32lb52x_init(MachineState *machine)
 {
     Sifli52xMachineState *s = SIFLI_SF32LB52X_MACHINE(machine);
@@ -147,6 +197,17 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     memory_region_init_ram(&s->sram, NULL, "sifli.sram",
                            SF32LB52X_SRAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, SF32LB52X_SRAM_BASE, &s->sram);
+
+    /*
+     * PSRAM is plain RAM here. Bringing it up is the MPI's job -- read
+     * latency, write latency, the QSPI mode -- and the HAL asks for that
+     * through registers the RCC/MPI banks already answer; once the firmware
+     * believes it is up, what it does with the memory is ordinary loads and
+     * stores.
+     */
+    memory_region_init_ram(&s->psram, NULL, "sifli.psram",
+                           s->psram_size, &error_fatal);
+    memory_region_add_subregion(sysmem, SF32LB52X_PSRAM_BASE, &s->psram);
 
     /* CPU, NVIC and SysTick */
     object_initialize_child(OBJECT(s), "armv7m", &s->armv7m, TYPE_ARMV7M);
@@ -301,6 +362,41 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     }
 
     /*
+     * The two graphics accelerators. Neither is touched during boot -- the
+     * EPIC driver only memsets its handle in an INIT_PRE_APP_EXPORT hook,
+     * and the EZIP driver does not run at all until LVGL opens the GPU -- so
+     * they exist here for the sake of firmware that goes on to use them.
+     *
+     * The EZIP decoder path comes from the machine property, or the
+     * environment when a script would rather not spell it out on the command
+     * line. Neither is an error to leave unset; see hw/display/sifli-ezip.c.
+     */
+    {
+        DeviceState *epic = qdev_new(TYPE_SIFLI_EPIC);
+        DeviceState *ezip = qdev_new(TYPE_SIFLI_EZIP);
+        const char *tool = s->ezip_tool;
+
+        if (tool == NULL) {
+            tool = g_getenv("SIFLI_EZIP_TOOL");
+        }
+        if (tool != NULL) {
+            qdev_prop_set_string(ezip, "tool", tool);
+        }
+
+        object_property_add_child(OBJECT(machine), "epic", OBJECT(epic));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(epic), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(epic), 0, SF32LB52X_EPIC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(epic), 0,
+                           qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_EPIC));
+
+        object_property_add_child(OBJECT(machine), "ezip", OBJECT(ezip));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ezip), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ezip), 0, SF32LB52X_EZIP1_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(ezip), 0,
+                           qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_EZIP));
+    }
+
+    /*
      * Anything the firmware touches beyond this reads back as zero, because
      * mc->ignore_memory_transaction_failures is set. To find out what is
      * still missing, add create_unimplemented_device("sifli.<name>", base,
@@ -349,6 +445,25 @@ static void sifli_sf32lb52x_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "flash-size",
         "Size of the boot QSPI flash XIP window in bytes");
+
+    object_class_property_add(oc, "psram-size", "uint32",
+                              sifli_get_psram_size, sifli_set_psram_size,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "psram-size",
+        "Size of the MPI1 PSRAM in bytes (board property: mem_map.h takes it "
+        "from BSP_QSPI1_MEM_SIZE)");
+
+    /*
+     * This one cannot have a default: QEMU is not run from the SDK and has
+     * no way to find its tools/png2ezip directory. Unset, the EZIP model
+     * still decodes gzip and LZ4; only the proprietary format stops, with a
+     * guest error saying so.
+     */
+    object_class_property_add_str(oc, "ezip-tool",
+                                  sifli_get_ezip_tool, sifli_set_ezip_tool);
+    object_class_property_set_description(oc, "ezip-tool",
+        "Path to the SDK's png2ezip host decoder (ezip_linux/ezip.exe), "
+        "needed for the proprietary EZIP format");
 }
 
 static const TypeInfo sifli_sf32lb52x_machine_typeinfo = {

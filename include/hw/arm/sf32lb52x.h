@@ -58,6 +58,18 @@
 #define SF32LB52X_SRAM_SIZE         (512 * KiB)
 
 /*
+ * Off-chip PSRAM, on MPI1.
+ *
+ * mem_map.h hangs this off the QSPI1 memory size (PSRAM_BASE 0x60000000,
+ * PSRAM_SIZE = BSP_QSPI1_MEM_SIZE), so the capacity is a board property like
+ * the flash one: -M sf32lb52x,psram-size=... The default is what the boards
+ * currently in the SDK carry and what their linker scripts lay out data in
+ * (__PSRAM_BASE 0x60400000, 4 MB of it).
+ */
+#define SF32LB52X_PSRAM_BASE        0x60000000ULL
+#define SF32LB52X_PSRAM_SIZE        (16 * MiB)
+
+/*
  * Peripheral windows.
  *
  * HPSYS sits at 0x5000_0000 on this series. Note that 56x/58x swap the
@@ -83,6 +95,8 @@
 #define SF32LB52X_GPIO2_BASE        0x40080000ULL
 #define SF32LB52X_I2C1_BASE         0x5009c000ULL
 #define SF32LB52X_SPI1_BASE         0x50095000ULL
+#define SF32LB52X_EZIP1_BASE        0x50006000ULL
+#define SF32LB52X_EPIC_BASE         0x50007000ULL
 #define SF32LB52X_MPI1_BASE         0x50041000ULL
 #define SF32LB52X_MPI2_BASE         0x50042000ULL
 #define SF32LB52X_HPSYS_RCC_BASE    0x50000000ULL
@@ -251,6 +265,7 @@ extern const unsigned sf32lb52x_num_usarts;
 #define SF32LB52X_IRQ_USART1        59
 #define SF32LB52X_IRQ_SPI1          60
 #define SF32LB52X_IRQ_I2C1          61
+#define SF32LB52X_IRQ_EPIC          62
 #define SF32LB52X_IRQ_GPTIM1        70
 #define SF32LB52X_IRQ_GPTIM2        71
 #define SF32LB52X_IRQ_BTIM1         72
@@ -261,6 +276,7 @@ extern const unsigned sf32lb52x_num_usarts;
 #define SF32LB52X_IRQ_GPIO1         84
 #define SF32LB52X_IRQ_MPI1          85
 #define SF32LB52X_IRQ_MPI2          86
+#define SF32LB52X_IRQ_EZIP          89
 #define SF32LB52X_IRQ_I2C3          93
 #define SF32LB52X_IRQ_USART3        95
 /* CRC has no interrupt line on this series. */
