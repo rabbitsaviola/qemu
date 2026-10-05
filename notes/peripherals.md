@@ -347,7 +347,202 @@ CIRC 绕回时，硬件**把 CM0AR 也恢复到通道使能时的值**，不只�
 
 ---
 
-## 6. 加一个新外设
+## 6. EZIP（解压加速器）
+
+LVGL 的 GPU 后端、`middleware/ezipa_dec/` 和 DFU 都走它。窗口
+`0x50006000`–`0x5000609c`（40 个字），IRQ 89。
+
+### 6.1 完成握手：两个中断寄存器，且都不受 INT_EN 管
+
+HAL 有两条路，等的**不是同一个寄存器**：
+
+| 路径 | 等什么 | 出处 |
+|---|---|---|
+| `HAL_EZIP_Decode`（轮询） | `while (0 == INT_MASK)` | `bf0_hal_ezip.c:599` |
+| `HAL_EZIP_Decode_IT`（中断） | `INT_EN = END\|…`，ISR 里读 `INT_STA` | 同上 `:678`、`:496` |
+
+所以模型完成时**同时**置 `INT_STA` 和 `INT_MASK`，两个都是 W1C、也都不受
+`INT_EN` 影响；`INT_EN` 只管中断线（`INT_EN & INT_MASK` 的按位与，电平）。
+只做一个是会挂的：轮询那条永远等不到，而它从头到尾没碰过 `INT_EN`。
+
+`EZIP_CTRL` bit0 写 1 启动，模型**在这次 MMIO 写里就解完**——写返回时
+`INT_*` 已经置好、IRQ 89 已经拉高，固件接着去取信号量就能过。
+
+### 6.2 输入长度：52x 上 `SRC_LEN` 根本没人写
+
+`HAL_EZIP_MULTI_BLOCK_DECODING_SUPPORTED` 只在 `EZIP_EZIP_PARA_LAST` 存在时
+才定义（`drivers/Include/bf0_hal_ezip.h:36`），而 52x 的 `ezip.h` 里没有这个
+字段——于是 `HAL_EZIP_Decode` 里写 `SRC_LEN` 的那段**被编译掉了**，寄存器
+恒为 0。这不是模型抄近路，是这颗芯片的真实行为。
+
+模型于是从位流自己读长度：
+
+| 模式 | `SRC_ADDR` 指着什么 | 长度从哪来 |
+|---|---|---|
+| GZIP | 裸 deflate 流 | zlib 解到 `Z_STREAM_END` 自己停 |
+| LZ4 | `[LE u32 块长][LZ4 块]` | 先读那 4 字节 |
+| EZIP 私有 | 私有比特流 | 交给工具，它自己认 |
+
+**"GZIP 模式"吃的不是 gzip 流，是裸 deflate。** SDK 的资产生成命令是
+`ezip -gzip <file> -length -noheader`（`docs/source/zh_CN/app_note/ezip_tool_usage.md`
+里写着"4 字节长度后面的都是 gzip 压缩数据，即直接作为硬件 ezip 的输入部分"）
+——头已经被剥掉了。示例资产印证了这点：`assets/gzip_input.dat` 里看着像 gzip
+头的 `1f 8b 08 08` 其实在注释掉的行里，真正的流是个匿名 deflate 块，而且末尾
+还挂着 gzip 的 CRC32/ISIZE（deflate 解码器根本走不到那儿，硬件也照样不管）。
+所以模型是 `inflateInit2(&z, -15)`：喂一个完整的 gzip 流给它反而会解错，
+这一点和硬件一致。
+
+读取上界是设备属性 `window-bytes`（默认 64 KiB），再被夹到源地址所在内存
+区域的末尾。这里有个 `address_space_translate()` 的坑：**它的 `len` 是入出
+参**，进来是调用者的上界、出去被 `physmem.c:395` 夹到区域尾；不初始化就拿
+栈上的垃圾去夹，结果是随机的 `len == 0`。
+
+### 6.3 私有格式：真的去跑 SDK 的 ezip 工具
+
+SDK 里没有私有格式的软件解码器（`external/ffmpeg/libavcodec/ezipdec.c` 只是
+把 packet 拷进帧缓冲）。所以机器属性 `ezip-tool=`（或环境变量
+`SIFLI_EZIP_TOOL`）指向 `tools/png2ezip/ezip_linux`，模型用 `g_spawn_sync()`
+同步调它：
+
+```
+ezip -convert in/image.ezip -spt 1 -dpt 1 -binfile 1 \
+     -dec_off_no_header 0 -outdir out
+```
+
+两个细节是拿 SDK 自带资产标定出来的，不是猜的：`-binfile 1` 会把扩展名换成
+`.bin`（产出叫 `image.bin` 而不是 `image.ezip`）；产出文件前面还有 4 字节容器
+头（宽高大端 u16），要跳过再写进 `DST_ADDR`，顺便用它填 `DB_DATA1`。
+
+**这次调用是在 MMIO 写处理里同步阻塞的**——开发用模型可以接受，但它会让
+vCPU 停住几十毫秒。只有私有格式走这条路。工具路径没给或者找不到，就记一笔
+`LOG_GUEST_ERROR` 照常完成，不挂死。
+
+### 6.4 不做的事
+
+- `OUT_SEL = EPIC`（解压结果直接喂 EPIC 流水线，LVGL GPU 走这条）：记一笔后
+  照常完成，目标内存不动。
+- AEZIP / animation（`AEZIP_CTRL`、`FRAME_*`、`SEQ_NUM`）只存寄存器。
+- `IN_SEL` 选 NAND/QSPI 输入：只做 AHB 输入。
+- 多块解码：52x 上本来就编译掉了。
+
+---
+
+## 7. EPIC（2D 图形引擎）
+
+窗口 `0x50007000`–`0x5000715c`，IRQ 62。
+
+### 7.1 没有操作码
+
+`EPIC_RUN()` 就是 `COMMAND |= START`（`bf0_hal_epic.c:522`），而 `COMMAND`
+只有 `START`(bit0) / `RESET`(bit1)。**硬件没有"这次干什么"这个字段**——一次
+作业是什么完全由当时活着的寄存器决定：`CANVAS_*` + `AHB_*` 给出目标矩形、
+内存地址、行距和输出格式，各 `Ln_CFG.ACTIVE` 决定哪些图层参与。
+
+模型就照着读题：先把 `CANVAS_BG` 铺满矩形（除非置了 bypass），再按硬件顺序
+（L0 是背景先画、VL 是前景后画）把每个 ACTIVE 图层混上去。填充、拷贝、混合
+在硬件上本来是同一条路，在模型里也是——`HAL_EPIC_Copy_IT` 和
+`HAL_EPIC_BlendStart*` 的差别只是留下的寄存器不同。
+
+### 7.2 为什么必须同步完成
+
+`EPIC_WaitDone()` 在 52x 上是裸 `while (STATUS != 0)`（`bf0_hal_epic.c:4431`）。
+更麻烦的是 `EPIC_WaitValidInstance()`：`STATUS != 0` 且存在 RAM shadow 时，它
+会把后续寄存器写**改道到 shadow**，然后再调 `EPIC_WaitDone()`——于是模型只要
+报"忙"，固件就永久自旋，而且看栈还看不出来。所以 STATUS 恒为 0：活在这次写
+里干完。
+
+### 7.3 alpha 的极性由源格式决定
+
+`Ln_CFG` 里有 `ALPHA_SEL`(bit4)、`ALPHA[12:5]`、`ALPHA_BLEND`(bit31)。
+HAL 的写法（`bf0_hal_epic.c:1897`、`:4025`）是：
+
+- 源带 alpha 通道（非 RGB565/RGB888/MONO）→ 置 `ALPHA_BLEND`，逐像素取 `px.a`
+- 源不带 alpha → 置 `ALPHA_SEL`，用 `ALPHA` 常量
+- 整层不透明 → 两个都不置，`ALPHA` 填 255
+
+注意 `ALPHA` 字段在**前两种情况下都会被写**，所以判断顺序是
+**先 `ALPHA_SEL`、再 `ALPHA_BLEND`**；反过来会把该逐像素混的图层当成常量混，
+而常量恰好也是调用者传的那个值，看起来"差不多对"——qtest 那节就是钉这个的。
+
+### 7.4 `CANVAS_BG` 的两个 bypass 位
+
+`BG_BLENDING_BYPASS`(bit24，SDK 里就是这个叠了两个 BG 的拼写)、
+`ALL_BLENDING_BYPASS`(bit25)，**任一个置起都不清画布**。拷贝那条路置
+`ALL_BLENDING_BYPASS` 且把 `CANVAS_BG` 留在 0——照清不误的话，会把马上要读的
+目标先擦掉。
+
+### 7.5 不做的事（记一笔、照常置 STATUS=0，但画出来的是错的）
+
+旋转（`VL_ROT`、`*_ROT_M_*`）、缩放（`SCALE_RATIO_*`、`SCALE_INIT_*`）、YUV
+输入、dither、`MASK_*`、A8/A4/A2/L8 源格式（要色彩坐标引擎和调色板），以及
+`AHB_CTRL.DESTINATION = LCD`（只做写内存）。
+
+**遇到这些也照常完成**是刻意的：作业用了它们，固件就在等它，卡死比画错更难
+查。L1/L2 在这颗芯片上不存在（HAL 为 `SF32LB52X` 定义 `EPIC_L2_L1_INVALID`，
+`bf0_hal_epic.c:154`），寄存器存着但够不到。
+
+---
+
+## 8. 内存：PSRAM 与两条地址通路
+
+### 8.1 PSRAM 就是一块 RAM
+
+`mem_map.h` 把 PSRAM 挂在 QSPI1 的容量上（`PSRAM_BASE 0x60000000`，
+`PSRAM_SIZE = BSP_QSPI1_MEM_SIZE`），所以容量是**板子属性**，做成 machine 属性
+`psram-size`，默认 16 MB——`sf32lb52-lcd_a128r16` 的板子配置就是这个数。
+
+模型侧只有 `memory_region_init_ram()`。把它拉起来是 MPI 的事（读延迟、写延迟、
+QSPI 模式），HAL 问的那些寄存器 RCC/MPI 那几张表已经在答了；固件认为它起来了
+之后，对这块内存做的事就是普通的 load/store。
+
+**`hello_world` 用不到它**：它的 `.RW_PSRAM_NON_RET` 段长度是 0，所以第 8 项检查
+从来没碰过 PSRAM。`example/hal/epic` 才是第一个真往里放东西的（0x868a0 字节的
+三个 buffer），加 PSRAM 就是为了让它能跑。
+
+### 8.2 图层 `SRC` 和 `AHB_MEM` 不是一回事
+
+**同一个 buffer，交给 EPIC 的两个寄存器，地址形式不一样：**
+
+| 寄存器 | HAL 怎么写 | 出处 |
+|---|---|---|
+| 图层 `VL_SRC`/`L0_SRC`/`MASK_SRC`/`Y_SRC`… | `HCPU_MPI_SBUS_ADDR(config->data)` | `bf0_hal_epic.c:1885,2070,3050,3357,3535,4015` |
+| `AHB_MEM`（输出） | 裸指针 `(uint32_t)output->data + offset` | `bf0_hal_epic.c:2255,2377` |
+
+原因是 MPI 要能分辨"这次访问是 CPU 发的还是外设发的"：外设读 flash 时 HAL 把
+地址 **+0x50000000**（`HPSYS_MPI_MEM_CBUS_2_SBUS_OFFSET`）再给它，落进 SBUS 窗口。
+`HCPU_MPI_SBUS_ADDR` 只对 `[0x10000000, 0x20000000)` 里的地址做这个加法，别的
+原样传出去——所以 PSRAM 指针（0x6040_0000 起）不会被加，`AHB_MEM` 更是根本不走
+这个宏。
+
+模型要把它倒回来，因为模型读 guest 用的是 CPU 视角的地址空间。
+`sifli_sbus_to_cpu_addr()`（`include/hw/misc/sifli-sbus.h`）就干这个。
+
+### 8.3 翻译窗口为什么只有 4 MB
+
+**这是 PSRAM 加进来之后才暴露的**：SBUS 窗口从 0x6000_0000 起，PSRAM 也在
+0x6000_0000，两者重叠。`HCPU_MPI_SBUS_ADDR` 加出来的地址和 PSRAM 自己的地址，
+**光看地址分不出来**——真硬件是按 MPI 实例分的，一个平坦地址空间里表达不了。
+
+好在 SDK 自己的布局把它们错开了：链接脚本的 `__PSRAM_BASE` 是 **0x6040_0000**，
+即 PSRAM 的数据区从 4 MB 处才开始。所以窗口取 `[0x6000_0000, 0x6040_0000)`：
+
+```c
+#define SIFLI_SBUS_FLASH_SIZE   0x00400000u
+```
+
+- EZIP 例程的资产在 flash 0x1007_71EC → 寄存器里是 0x6007_71EC → 减回
+  0x1007_71EC，**在窗口内**，对。
+- EPIC 例程的图层 buffer 在 PSRAM 0x6046_E200 → 寄存器里还是 0x6046_E200
+  → 窗口外，不动，对。
+
+**超过 4 MB 的 flash 地址会被翻错**（`addr - 0x50000000` 落到 PSRAM 上），
+这棵树里没有固件这么干。真要做对得给外设单开一个 SBUS 的 `AddressSpace`，
+把两条通路在地址空间层面分开——现在不值得，但要知道这个洞在哪。
+
+---
+
+
+## 9. 加一个新外设
 
 **纯配置的（GPIO 配置、PINMUX、LPSYS_CFG…）**：
 1. 在 `sf32lb52x-periph.c` 里加一张 `SifliRegDef[]` 表
@@ -365,7 +560,7 @@ CIRC 绕回时，硬件**把 CM0AR 也恢复到通道使能时的值**，不只�
 
 ---
 
-## 7. 真实固件 bring-up 记录
+## 10. 真实固件 bring-up 记录
 
 用 `sf32lb52-lcd_a128r16` 的 `hello_world`（SDK 原样构建，固件一行不改）逐个
 排查出来的。**这些用 `hello_qemu` 那种 semihosting 桩永远发现不了**——它一个
@@ -374,7 +569,7 @@ HAL 寄存器都不碰。
 排查手法：固件跑起来后从 monitor 采 `info registers` 看 PC，两次采样相同就是
 死循环，再用 `arm-none-eabi-addr2line` 把地址翻回源码行。
 
-### 7.1 DWT 周期计数器（QEMU 的缺口）
+### 10.1 DWT 周期计数器（QEMU 的缺口）
 
 PC 停在 `HAL_Delay_us_`（`bf0_hal.c:407`）：
 
@@ -390,9 +585,9 @@ bcc.n ...
 `HAL_RCC_HCPU_ConfigHCLK(240)` → `EnableDLL1` → `HAL_Delay_us(10)`。
 
 补了 `hw/misc/armv7m_dwt.c`（和 `armv7m_ras.c` 并列，同挂 `CONFIG_ARM_V7M`）。
-见 §7.2 关于它为什么必须挂进 armv7m 的 container。
+见 §10.2 关于它为什么必须挂进 armv7m 的 container。
 
-### 7.2 armv7m container 的优先级陷阱
+### 10.2 armv7m container 的优先级陷阱
 
 把 DWT 映射进 board 的 system memory **不生效**，尽管 `info mtree -f` 里能看到它：
 
@@ -418,7 +613,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 **教训**：`info mtree` 会把重叠的两段都列出来，光看它会被骗。要确认一个
 区域真的生效，得实际读写它。
 
-### 7.3 RTC 的 LXT 使能位（分支走错）
+### 10.3 RTC 的 LXT 使能位（分支走错）
 
 越过 DWT 后卡在 `bf0_hal_lrc_cal.c:894`，轮询 BT MAC 的 `RCCAL_RESULT`。
 
@@ -436,7 +631,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 把 RTC 块建起来让这一位存住即可，**比为了这一位去建模 BT MAC 便宜得多**，
 也更接近真实板子（板上有 LXT 晶振）。
 
-### 7.4 MPI 的 CALCR.DONE
+### 10.4 MPI 的 CALCR.DONE
 
 `HAL_MPI_OPSRAM_CAL_DELAY`（`bf0_hal_mpi_psram.c:1386`）：写 `CALCR.EN`(bit31)
 启动校准，然后轮询 `CALCR.DONE`(bit8)。和 RCC 的 `HRCCAL1.CAL_DONE` 同型
@@ -451,7 +646,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 | `SR.BUSY` bit31 | 忙 | `HAL_FLASH_IS_BUSY()` |
 | `CALCR.DONE` bit8 | 校准完成 | `bf0_hal_mpi_psram.c:1386` |
 
-### 7.5 RTC_ISR 的六个就绪标志
+### 10.5 RTC_ISR 的六个就绪标志
 
 `RTC_EnterInitMode`（`bf0_hal_rtc.c:1009`）置 `ISR.INIT`(bit10) 后等
 `ISR.INITF`(bit9)。把 `bf0_hal_rtc.c` 里所有 `while` 找出来后发现有六个
@@ -472,7 +667,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 才知道那个分支被 `if (hrtc->Instance->CR & RTC_CR_WUTE)` 保护着，而 WUTE 我们
 从不置位，所以强制置 1 是安全的。**这类冲突必须读代码，猜不出来。**
 
-### 7.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
+### 10.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
 
 音频这块**故意只建了极少的寄存器**，其余留白：
 
@@ -500,7 +695,7 @@ pll_cnt = PLL_CAL_RESULT >> PLL_CNT_Pos;
 
 **先判断循环是否本身有界，再决定要不要伪造终态。**
 
-### 7.7 结果
+### 10.7 结果
 
 `sf32lb52-lcd_a128r16` 的 `hello_world`，SDK 原样构建、一行不改：
 
@@ -521,7 +716,7 @@ msh />
 跑到 `main()` 并停在 RT-Thread 的 msh 提示符上。`notes/verify-sifli.sh` 第 8 项
 就是跑这个。
 
-### 7.8 规律
+### 10.8 规律
 
 到目前为止**每一个坑都是同一个形状**：没建模的寄存器读回 0，固件据此做了
 一个真实硬件上不会做的判断，然后走进死循环或错误分支。所以薄模型的重点
@@ -529,7 +724,7 @@ msh />
 
 ---
 
-## 8. 排查
+## 11. 排查
 
 **看固件碰了哪些没建模的地址**：
 

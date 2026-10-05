@@ -11,6 +11,10 @@
 #   SIFLI_QEMU_SRC    源码树   （默认 ~/code/sifli-qemu）
 #   SIFLI_QEMU_BUILD  构建目录 （默认 ~/build-sifli）
 #   SIFLI_REAL_FW     真实板子固件；传 "-" 跳过那一项
+#   SIFLI_EZIP_FW     例程固件；传 "-" 跳过那一项
+#   SIFLI_EZIP_TOOL   宿主的 ezip 解码器（私有格式要用）
+#   SIFLI_EPIC_FW     EPIC 例程固件；传 "-" 跳过那一项
+#   SIFLI_ARM_NM      arm-none-eabi-nm（要从固件里读 buffer2 的地址）
 
 set -u
 
@@ -61,6 +65,11 @@ hw/char/sifli-usart.c
 include/hw/char/sifli-usart.h
 hw/dma/sifli-dma.c
 include/hw/dma/sifli-dma.h
+hw/display/sifli-epic.c
+include/hw/display/sifli-epic.h
+hw/display/sifli-ezip.c
+include/hw/display/sifli-ezip.h
+include/hw/misc/sifli-sbus.h
 hw/misc/sifli-regbank.c
 include/hw/misc/sifli-regbank.h"
 
@@ -93,6 +102,7 @@ if [ -d "$SRC/.git" ]; then
               hw/arm/Kconfig hw/arm/meson.build \
               hw/char/Kconfig hw/char/meson.build \
               hw/dma/Kconfig hw/dma/meson.build \
+              hw/display/Kconfig hw/display/meson.build \
               hw/misc/Kconfig hw/misc/meson.build 2>/dev/null \
           | grep 'w/crlf' || true)
     if [ -z "$bad" ]; then
@@ -136,6 +146,8 @@ if [ ! -x "$BUILD/qemu-system-arm" ]; then
 else
     probe_in=$(cat <<'EOF'
 info mtree
+xp /1wx 0x50006000
+xp /1wx 0x50007000
 xp /1wx 0x40040040
 xp /1wx 0x50000020
 xp /1wx 0x5000002c
@@ -165,16 +177,18 @@ EOF
         done
 
         # 两个 DMAC 的 region 同名，所以按地址认，两个都必须在。
-        while read -r a what; do
+        while read -r a region what; do
             [ -n "$a" ] || continue
-            if echo "$probe" | grep -q "$a-.*sifli-dma"; then
+            if echo "$probe" | grep -q "$a-.*$region"; then
                 pass "$what 已映射（$a）"
             else
                 fail "$what 不在 info mtree 里（$a）"
             fi
         done <<'EOF'
-50081000 DMAC1
-40001000 DMAC2
+50081000 sifli-dma  DMAC1
+40001000 sifli-dma  DMAC2
+50006000 sifli-ezip EZIP1
+50007000 sifli-epic EPIC
 EOF
 
         # 地址 期望值 说明
@@ -198,6 +212,8 @@ EOF
 500ca020 0x80000000 PMUC.LXT_CR RDY
 40040040 0x00000000 LPSYS_AON.SLP_CTRL SLEEP_STATUS 读 0
 5008401c 0x000000c0 USART1.ISR TXE|TC 恒置
+50006000 0x00000000 EZIP1.CTRL 复位后为 0（弱检查，写路径在 qtest 里）
+50007000 0x00000000 EPIC.COMMAND 复位后为 0（同上）
 EOF
     fi
 fi
@@ -222,7 +238,7 @@ echo
 # 这一项才是真正的验收。
 #
 # 第 6、7 项只是结构性地读几个寄存器，模型写错了它们照样能过
-# （peripherals.md §7.2 那个 DWT 映射错位的坑就骗过了它们全部）。只有这里
+# （peripherals.md §10.2 那个 DWT 映射错位的坑就骗过了它们全部）。只有这里
 # ——SDK 原样构建的真实板子固件、一行不改——能证明整个 HAL 真的在模型上跑
 # 起来了：时钟树、电源、RTC、MPI、音频、控制台，一路到 main() 和 RT-Thread
 # 的 shell。
@@ -299,6 +315,186 @@ else
     else
         fail "没看到：$missing。最后几行："
         echo "$out" | tail -6 | sed 's/^/         /'
+    fi
+fi
+echo
+
+# ----------------------------------------------------- 9. 真实板子固件：EZIP
+# 第 8 项证明固件能跑起来，这一项证明它**跑出了正确结果**。
+#
+# example/hal/ezip 自带测试向量和期望资产：main() 依次跑 EZIP 私有格式（轮询）、
+# EZIP 私有格式（中断）、LZ4、GZIP，每一条都把解出来的缓冲和期望资产整个
+# memcmp 一遍，对了才打 "[EZIP]Output is correct."。四句都在，说明三条解码
+# 路径（宿主工具 / LZ4 / GZIP）和两种完成握手（轮询读 INT_MASK；中断走
+# INT_EN → IRQ 89 → 信号量）都在模型上跑对了。
+#
+# 这不是第 7 项能替代的：qtest 是自己拼一段位流喂进去，固件这边是**原样的
+# SDK 资产、原样的 HAL 调用序列**，而且私有格式那条真的去 spawn 了 ezip_linux。
+#
+# 私有格式那两条要把工具路径传给机器属性，所以工具不在就整条跳过 —— 那一半
+# 验不了，剩下的不值得单独跑。
+#
+# 固件最后 while(1) 不退出，看着输出把它杀掉。
+#
+# 构建：
+#   cd <SDK>/example/hal/ezip/project
+#   scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+echo "[9] 真实板子固件（sf32lb52-lcd_a128r16 ezip）"
+EZIP_FW=${SIFLI_EZIP_FW:-/mnt/e/code2/SiFli-SDK/example/hal/ezip/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf}
+EZIP_TOOL=${SIFLI_EZIP_TOOL:-/mnt/e/code2/SiFli-SDK/tools/png2ezip/ezip_linux}
+if [ "$EZIP_FW" = "-" ]; then
+    skip "按要求跳过"
+elif [ ! -f "$EZIP_FW" ]; then
+    skip "固件不存在，先用 scons 构建：$EZIP_FW"
+elif [ ! -x "$EZIP_TOOL" ]; then
+    skip "找不到宿主解码器 $EZIP_TOOL"
+else
+    fifo=$(mktemp -u)
+    log=$(mktemp)
+    mkfifo "$fifo"
+    # 和第 8 项一样：让 stdin 那头一直是开着的，免得 chardev 在 EOF 上被摘掉。
+    exec 3<>"$fifo"
+    timeout 120 "$BUILD/qemu-system-arm" -M "sf32lb52x,ezip-tool=$EZIP_TOOL" \
+        -display none -serial stdio -monitor none \
+        -kernel "$EZIP_FW" < "$fifo" > "$log" 2>&1 &
+    qpid=$!
+
+    for _ in $(seq 1 1200); do
+        [ "$(grep -c 'Output is correct' "$log" 2>/dev/null)" -ge 4 ] && break
+        grep -q 'Output is incorrect' "$log" 2>/dev/null && break
+        kill -0 "$qpid" 2>/dev/null || break
+        sleep 0.1
+    done
+
+    kill "$qpid" 2>/dev/null
+    wait "$qpid" 2>/dev/null
+    exec 3>&-
+    rm -f "$fifo"
+
+    out=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
+    rm -f "$log"
+
+    ok=$(echo "$out" | grep -c '\[EZIP\]Output is correct\.')
+    bad=$(echo "$out" | grep -c '\[EZIP\]Output is incorrect\.')
+    if [ "$ok" -eq 4 ] && [ "$bad" -eq 0 ]; then
+        pass "私有格式/私有格式中断/LZ4/GZIP 四条解出来都与资产逐字节一致"
+    else
+        fail "通过 $ok/4 条，报错 $bad 条。最后几行："
+        echo "$out" | tail -6 | sed 's/^/         /'
+    fi
+fi
+echo
+
+# ----------------------------------------------------- 10. 真实板子固件：EPIC
+# 第 8 项证明固件能跑起来，第 9 项证明解压的解对了，这一项证明**画出来的像素
+# 对了** —— 而且是 SDK 原样的例程、原样的 EPIC HAL 调用序列。
+#
+# example/hal/epic 的两级 alpha 混合（前景蓝 150x100 @(50,50)，背景红
+# 150x100 @(100,100)，都 alpha=128，输出 250x200 到 390 像素宽的全屏 buffer），
+# 三个 buffer 都在 PSRAM 里（L2_NON_RET_BSS_SECT → .RW_PSRAM_NON_RET）。
+# 所以这一项同时验了：EPIC 的填充、图层定位、alpha 混合，以及 PSRAM 和
+# EPIC 之间的那条通路（AHB_MEM 走 CPU 地址，图层 SRC 走 SBUS 别名）。
+#
+# 例程自己不查像素，只查 HAL 的返回值，所以这里把输出 buffer 读回来自己比。
+# 采样点按区域挑：画布（黑）、只有前景（50% 的蓝）、只有背景（50% 的红）、
+# 前景和背景重叠处（红压在蓝上，0x8008）。混出来的具体数值取决于模型怎么
+# 取整，这几处不一样就说明图层位置或混合顺序错了。
+#
+# 固件最后 while(1) 不退出：等它打完 "EPIC blend succeeded"，从 monitor 把
+# 机器停下来读内存，再 quit。
+#
+# 构建：
+#   cd <SDK>/example/hal/epic/project
+#   scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+echo "[10] 真实板子固件（sf32lb52-lcd_a128r16 epic）"
+EPIC_FW=${SIFLI_EPIC_FW:-/mnt/e/code2/SiFli-SDK/example/hal/epic/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf}
+ARM_NM=${SIFLI_ARM_NM:-arm-none-eabi-nm}
+if [ "$EPIC_FW" = "-" ]; then
+    skip "按要求跳过"
+elif [ ! -f "$EPIC_FW" ]; then
+    skip "固件不存在，先用 scons 构建：$EPIC_FW"
+elif ! command -v "$ARM_NM" >/dev/null 2>&1; then
+    skip "找不到 $ARM_NM —— 输出 buffer 的地址要从固件符号表里读"
+else
+    # 输出 buffer 的地址是链接期定的（__PSRAM_BASE），所以从符号表读，别写死。
+    # 行宽来自板子的 LCD_HOR_RES_MAX=390（例程打印的 "LCD Info: Width=390"
+    # 也是它），RGB565 所以一行 780 字节。
+    buf2=$("$ARM_NM" "$EPIC_FW" 2>/dev/null | awk '$3 == "buffer2" {print $1}')
+    ROW=780
+    if [ -z "$buf2" ]; then
+        fail "读不到 buffer2 的地址"
+    else
+        ser=$(mktemp)
+        mon=$(mktemp)
+        monout=$(mktemp)
+        fifo=$(mktemp -u)
+        mkfifo "$fifo"
+
+        exec 3<>"$fifo"
+        timeout 120 "$BUILD/qemu-system-arm" -M sf32lb52x \
+            -display none -serial "file:$ser" -monitor stdio \
+            -kernel "$EPIC_FW" < "$fifo" > "$monout" 2>&1 &
+        qpid=$!
+
+        for _ in $(seq 1 900); do
+            grep -q 'EPIC blend succeeded' "$ser" 2>/dev/null && break
+            grep -q 'EPIC blend failed' "$ser" 2>/dev/null && break
+            kill -0 "$qpid" 2>/dev/null || break
+            sleep 0.1
+        done
+
+        # 停住机器再读内存。用 /1wx 按字读，所以采样点的 x 取偶数，一个字里
+        # 两个像素都落在同一个区域，期望值就是同一个值写两遍。
+        {
+            printf 'stop\n'
+            while read -r x y want what; do
+                [ -n "$x" ] || continue
+                printf 'xp /1wx 0x%08x\n' \
+                       $(( 0x$buf2 + y * ROW + x * 2 ))
+            done <<'EOF'
+10  10  0x00000000 画布（左上角）
+260 60  0x00000000 画布（右边）
+74  74  0x00100010 只有前景 —— alpha 128 的蓝
+198 74  0x00100010 只有前景（右边缘）
+240 124 0x80008000 只有背景 —— alpha 128 的红
+148 196 0x80008000 只有背景（下边缘）
+150 124 0x80088008 前景与背景重叠处
+EOF
+            printf 'quit\n'
+        } >&3
+
+        wait "$qpid" 2>/dev/null
+        exec 3>&-
+        rm -f "$fifo"
+
+        got=$(sed 's/\x1b\[[0-9;]*m//g' "$monout" \
+                  | grep -o '^00000000[0-9a-f]*: 0x[0-9a-f]*' | awk '{print $2}')
+        rm -f "$monout"
+
+        bad=""
+        exec 5<<<"$got"
+        while read -r x y want what; do
+            [ -n "$x" ] || continue
+            read -r have <&5
+            [ "$have" = "$want" ] || bad="$bad; $what 期望 $want 实际 ${have:-<读不到>}"
+        done <<'EOF'
+10  10  0x00000000 画布（左上角）
+260 60  0x00000000 画布（右边）
+74  74  0x00100010 只有前景 —— alpha 128 的蓝
+198 74  0x00100010 只有前景（右边缘）
+240 124 0x80008000 只有背景 —— alpha 128 的红
+148 196 0x80008000 只有背景（下边缘）
+150 124 0x80088008 前景与背景重叠处
+EOF
+        exec 5<&-
+
+        if [ -z "$bad" ]; then
+            pass "填充/图层定位/alpha 混合的 7 个采样点像素都对"
+        else
+            fail "混合结果不对：$bad。串口最后几行："
+            sed 's/\x1b\[[0-9;]*m//g' "$ser" | tail -4 | sed 's/^/         /'
+        fi
+        rm -f "$ser"
     fi
 fi
 echo

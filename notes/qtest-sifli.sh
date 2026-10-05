@@ -79,7 +79,76 @@ out=$(run \
     'readl 0x50081014' \
     'readl 0x50081000' \
     'writel 0x50081004 0xffffffff' \
-    'readl 0x50081000')
+    'readl 0x50081000' \
+    \
+    'write 0x20001000 0x10 0x13543276094d2bef98b96af719000000' \
+    'writel 0x50006018 0x00030000' \
+    'writel 0x50006008 0x20002000' \
+    'writel 0x50006004 0x20001000' \
+    'writel 0x5000600c 0x00000003' \
+    'writel 0x50006000 0x00000001' \
+    'readl 0x20002000' \
+    'readl 0x20002004' \
+    'readl 0x20002008' \
+    'readl 0x5000606c' \
+    'readl 0x50006070' \
+    'readl 0x50006028' \
+    \
+    'write 0x20001100 0xf 0x0b0000008001020304050607080800' \
+    'writel 0x50006018 0x00000000' \
+    'writel 0x50006008 0x20002040' \
+    'writel 0x50006004 0x20001100' \
+    'writel 0x5000600c 0x00000005' \
+    'writel 0x50006000 0x00000001' \
+    'readl 0x20002040' \
+    'readl 0x20002044' \
+    'readl 0x20002048' \
+    'readl 0x50006070' \
+    \
+    'writel 0x50006024 0x00000001' \
+    'readl 0x50006024' \
+    'readl 0x50006028' \
+    'writel 0x50006028 0x00000001' \
+    'readl 0x50006028' \
+    \
+    'write 0x20001180 0x8 0x0400000010aabb00' \
+    'writel 0x20002080 0xdeadbeef' \
+    'writel 0x50006024 0xffffffff' \
+    'writel 0x50006028 0xffffffff' \
+    'writel 0x50006008 0x20002080' \
+    'writel 0x50006004 0x20001180' \
+    'writel 0x5000600c 0x00000005' \
+    'writel 0x50006000 0x00000001' \
+    'readl 0x50006028' \
+    'readl 0x20002080' \
+    \
+    'writel 0x50007010 0x00000002' \
+    'writel 0x50007014 0x00000004' \
+    'writel 0x50007018 0x00112233' \
+    'writel 0x500070f8 0x00000002' \
+    'writel 0x500070fc 0x20003000' \
+    'writel 0x50007100 0x00000000' \
+    'writel 0x50007000 0x00000001' \
+    'readl 0x20003000' \
+    'readl 0x20003004' \
+    'readl 0x20003008' \
+    'readl 0x50007004' \
+    'readl 0x50007008' \
+    'readl 0x50007130' \
+    \
+    'write 0x20003100 0x4 0xffff0000' \
+    'write 0x20003200 0x4 0x00f800f8' \
+    'writel 0x50007018 0x02000000' \
+    'writel 0x50007010 0x00000000' \
+    'writel 0x50007014 0x00000001' \
+    'writel 0x500070fc 0x20003100' \
+    'writel 0x500070f8 0x00000000' \
+    'writel 0x50007054 0x00000000' \
+    'writel 0x50007058 0x00000001' \
+    'writel 0x50007060 0x20003200' \
+    'writel 0x50007050 0x40041010' \
+    'writel 0x50007000 0x00000001' \
+    'readl 0x20003100')
 
 if [ -z "$out" ]; then
     echo "拿不到 qtest 输出"
@@ -149,6 +218,136 @@ check 0x20000014 "CM0AR1 按 MINC 前进 4"
 check 0x7        "ISR 置 GIF1|TCIF1|HTIF1"
 # CGIF 是整组的清位（SVD：各标志"write 1 to CTCIF or CGIF"清除）。
 check 0x0        "IFCR 写 CGIF 后 ISR 清零"
+
+echo
+echo "[7] EZIP：解压到 AHB"
+# 12 个字节的明文 11 22 .. cc，raw deflate 之后 14 字节。走的是真实的解码路径：
+# PARA 选 MOD_GZIP + 输出到 AHB，写 CTRL.START 就出结果。
+#
+# 注意喂进去的是**裸 deflate，没有 gzip 头也没有尾**。SDK 的资产就是这么
+# 造的（`ezip -gzip <file> -length -noheader`，见 peripherals.md §6.2），
+# 硬件也只认这个：给它一个完整的 gzip 流，它会把头当成压缩数据，直接解错。
+check 0x44332211 "GZIP 前 4 字节"
+check 0x88776655 "GZIP 次 4 字节"
+check 0xccbbaa99 "GZIP 末 4 字节"
+# DB_DATA1 是几何：START/END_POINT 给的是 col 0..3、row 0，所以 4x1。
+# 位序是 row 在低半、col 在高半，写反了这里会是 2x3。
+check 0x40001    "DB_DATA1 = 宽 4 高 1"
+# DB_DATA2 是这次真正吃掉的输入字节数（deflate 流自己说自己到哪儿结束）。
+check 0xe        "DB_DATA2 = 14（裸 deflate 流的长度）"
+# HAL_EZIP_Decode 轮询的是 INT_MASK，不是 INT_STA，而且它从没碰过 INT_EN。
+check 0x1        "INT_MASK 置 END"
+
+echo
+echo "[7b] EZIP：LZ4"
+# 手工构造的裸 LZ4 块（前面 4 字节是块长，和 SDK 自己的 .dat 资产一致）：
+#   80           token：8 个字面量，匹配长度码 0
+#   01..08       8 个字面量
+#   08 00        偏移 8
+# 匹配长度码 0 即 4 字节，于是把前 8 个字节的头 4 个再吐一遍，共 12 字节。
+check 0x04030201 "LZ4 前 4 字节（字面量）"
+check 0x08070605 "LZ4 次 4 字节（字面量）"
+check 0x04030201 "LZ4 末 4 字节（按偏移 8 回拷）"
+check 0xf        "DB_DATA2 = 15（4 字节块长 + 11 字节块）"
+
+echo
+echo "[7c] EZIP：两个中断寄存器各自 W1C"
+check 0x0        "INT_STA 写 1 清位"
+# INT_MASK 是独立的一份，清 INT_STA 不该把它也清了 —— 轮询路径读的是它。
+check 0x1        "清 INT_STA 之后 INT_MASK 还在"
+check 0x0        "INT_MASK 自己写 1 也清得掉"
+
+echo
+echo "[7d] EZIP：坏块只报错，不动目标"
+# 偏移 0xbb 指向还没解出来的地方，解码器必须拒绝而不是把内存读穿。
+check 0x8        "INT_MASK 置 BTYPE_ERR"
+check 0xdeadbeef "目标内存原样没动"
+
+echo
+echo "[8] EPIC：不透明填充"
+# HAL_EPIC_Fill 的 alpha==0xFF 那一路根本不配图层，只写 CANVAS_BG 和矩形，
+# 所以这一段同时也在证明"没有图层也要画"。RGB888 输出，每像素 B,G,R。
+check 0x33112233 "填充像素 0（B=33 G=22 R=11）"
+check 0x22331122 "填充像素 1"
+check 0x11       "填充像素 2 的首字节"
+check 0x0        "STATUS 读回 0（作业在 START 那次写里做完）"
+check 0x10000    "EOF_IRQ 置 STATUS 位"
+# EPIC_WaitDone 在 52x 上会读它两次再写 0，所以它必须可读可写。
+check 0x0        "PERF_CNT 可读"
+
+echo
+echo "[8b] EPIC：图层混合"
+# 目标两个 RGB565 像素：白 0xFFFF、黑 0x0000，由 ALL_BLENDING_BYPASS 保住
+# 不被 CANVAS_BG 冲掉；L0 两个纯红 0xF800，ALPHA_SEL + ALPHA=128 常量混合。
+#   alpha = 128，out = (src*128 + dst*127 + 127) / 255
+#   白底：R=(255*128+255*127+127)/255=255  G=B=(0+255*127+127)/255=127
+#         -> 565 里 R=31 G=31 B=15 -> 0xFBEF
+#   黑底：R=(255*128+0+127)/255=128        G=B=0
+#         -> 565 里 R=16 -> 0x8000
+check 0x8000fbef "白底混出 0xFBEF，黑底混出 0x8000"
+
+echo
+echo "[9] EZIP：私有格式（真的去跑 SDK 的 ezip_linux）"
+# 这一节验的是模型和外部工具之间那段：把位流交给工具、把工具吐出来的
+# 4 字节头解析成宽高、再把头后面那 7548 个像素放进 DST。
+#
+# 用 SDK 自己的示例资产：源是 2980 字节的位流，期望结果是 7548 = 68*37*3
+# 字节的像素。比对整块内存，因为 readl 逐字读要 1887 次。
+#
+# 工具和资产都可能不在（比如只 checkout 了 qemu 这个仓库），那就跳过；
+# 真正的验收在真机固件那一步，这里只是把工具调用单独钉死。
+SDK=${SIFLI_SDK:-/mnt/e/code2/SiFli-SDK}
+TOOL=$SDK/tools/png2ezip/ezip_linux
+ASSET_SRC=$SDK/example/hal/ezip/assets/clock_mickey_shoe01_565A_s_ezip.dat
+ASSET_PIX=$SDK/example/hal/ezip/assets/clock_mickey_shoe01_565A.dat
+
+strip_array() {
+    sed 's,/\*.*\*/,,g; s,//.*,,' "$1" | grep -o '0x[0-9a-fA-F]\{2\}' \
+        | tr -d '\n' | sed 's/0x//g'
+}
+
+if [ ! -x "$TOOL" ] || [ ! -r "$ASSET_SRC" ] || [ ! -r "$ASSET_PIX" ]; then
+    echo "  [SKIP] 缺 $TOOL 或 SDK 资产，设 SIFLI_SDK 指向 SDK 根目录可打开"
+else
+    src_hex=$(strip_array "$ASSET_SRC")
+    pix_hex=$(strip_array "$ASSET_PIX")
+    src_len=$(( ${#src_hex} / 2 ))
+    pix_len=$(( ${#pix_hex} / 2 ))
+    if [ "$src_len" -ne 2980 ] || [ "$pix_len" -ne 7548 ]; then
+        echo "  [FAIL] 资产长度不对：源 $src_len，像素 $pix_len"
+        FAILED=$((FAILED + 1))
+    else
+        # 源放 0x20004000，结果放 0x20005000。
+        out9=$(printf '%s\n' \
+                "write 0x20004000 $src_len 0x$src_hex" \
+                'writel 0x50006008 0x20005000' \
+                'writel 0x50006004 0x20004000' \
+                'writel 0x5000600c 0x00000001' \
+                'writel 0x50006000 0x00000001' \
+                "b64read 0x20005000 $pix_len" \
+                quit \
+            | timeout 90 "$QEMU" -M "sf32lb52x,ezip-tool=$TOOL" -display none \
+                  -serial none -qtest stdio 2>/dev/null | tr -d '\r')
+        # b64read 是这一轮里唯一带载荷的 OK（write/writel 只回 OK）。
+        got=$(echo "$out9" | grep '^OK .' | tail -1 | sed 's/^OK //')
+        if [ -z "$got" ]; then
+            echo "  [FAIL] 拿不到 b64read 结果"
+            FAILED=$((FAILED + 1))
+        else
+            got_sha=$(printf '%s' "$got" | base64 -d | sha1sum | cut -d' ' -f1)
+            want_sha=$(printf '%s' "$pix_hex" | xxd -r -p | sha1sum \
+                       | cut -d' ' -f1)
+            if [ "$got_sha" = "$want_sha" ]; then
+                printf '  [PASS] %-40s = %s\n' \
+                    "私有格式 2980B -> 7548B 逐字节一致" "${got_sha:0:12}"
+            else
+                printf '  [FAIL] %-40s 期望 %s，实际 %s\n' \
+                    "私有格式解码" "${want_sha:0:12}" "${got_sha:0:12}"
+                FAILED=$((FAILED + 1))
+            fi
+        fi
+    fi
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then

@@ -10,7 +10,7 @@
 | 文件 | 用途 |
 |---|---|
 | `build-sifli.sh` | 本地构建（configure 过就跳过，日常只跑 ninja） |
-| `verify-sifli.sh` | 一条命令跑完八项检查，退出码可直接进 CI |
+| `verify-sifli.sh` | 一条命令跑完十项检查，退出码可直接进 CI |
 | `qtest-sifli.sh` | 单独验外设写路径，被 verify 的第 8 项调用 |
 | `peripherals.md` | 外设模型是怎么设计的、怎么加新的 |
 | `build-and-verify.md` | 本文 |
@@ -156,6 +156,87 @@ scons --board=sf32lb52-lcd_a128r16_hcpu -j8
 源码不同（一个打 `Hello world3!`，一个打 `Hello world!`），`ptab.yaml` 的分区
 布局也不同。报问题时要说清用的是哪棵树的固件。
 
+#### EZIP 示例固件 —— 从"跑起来"到"跑对了"
+
+上面那条只证明固件**跑起来了**。`example/hal/ezip` 更进一步：它自带测试向量和
+期望资产，`main()` 依次跑 EZIP 私有格式（轮询）、EZIP 私有格式（中断）、LZ4、
+GZIP，每一条都把解出来的缓冲和期望资产整个 `memcmp` 一遍，对了才打
+`[EZIP]Output is correct.`。
+
+```bash
+cd <SDK>/example/hal/ezip/project
+scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+
+cd ~/build-sifli
+timeout 120 ./qemu-system-arm -M sf32lb52x,ezip-tool=<SDK>/tools/png2ezip/ezip_linux \
+  -display none -serial stdio -monitor none \
+  -kernel <SDK>/example/hal/ezip/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
+```
+
+期望四句 `[EZIP]Output is correct.`，且没有 `incorrect`。四句齐了说明三条解码
+路径和两种完成握手都对：私有格式（真的 spawn 了 `ezip_linux`）、LZ4、GZIP，
+以及轮询读 `INT_MASK` 与中断走 `INT_EN`/IRQ 89 这两条路。这个固件最后 `while(1)`
+不退出，脚本同样是看着输出把它杀掉。
+
+`ezip-tool=` 不给的话私有格式那两条就解不出来（模型记一笔后照常完成，不挂死），
+所以脚本在找不到工具时整项 `[SKIP]`。
+
+SDK 在 `/mnt/e` 上时 `source export.sh` 会卡很久，见 §4⑦。
+
+#### EPIC 示例固件 —— 像素对不对
+
+`example/hal/epic` 跑两级 alpha 混合：前景蓝 150×100 @(50,50)、背景红 150×100
+@(100,100)，两个都 `alpha=128`，混到 250×200 输出区的全屏（390 像素宽）buffer
+里。三个 buffer 都在 PSRAM（`L2_NON_RET_BSS_SECT` → `.RW_PSRAM_NON_RET`）。
+
+**这个例程自己不查像素**，只查 `HAL_EPIC_BlendStartEx` 的返回值，所以 `EPIC
+blend succeeded` 只说明 HAL 的调用序列在模型上走完了。真正的检查是脚本把输出
+buffer 从内存里读回来自己比：
+
+```bash
+cd <SDK>/example/hal/epic/project
+scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+
+cd ~/build-sifli
+timeout 120 ./qemu-system-arm -M sf32lb52x \
+  -display none -serial file:/tmp/epic.log -monitor stdio \
+  -kernel <SDK>/example/hal/epic/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
+```
+
+固件跑起来之后，在 monitor 里敲（`(qemu) ` 是提示符，不是要敲的内容）：
+
+```
+stop
+xp /1wx 0x60417afc
+```
+
+`stop` 把 CPU 停住——例程最后是 `while(1)`，不停机读到的是会变的内存。`xp` 按
+**物理**地址读内存，`/1wx` 是"读一个单位、单位宽 4 字节、十六进制显示"。
+
+`0x60417afc` 是重叠区那个采样点：buffer2 的 `0x60400000` + 124 行 × 780 字节 +
+150 像素 × 2 字节。一个 word 装两个像素，读回来是 `0x80088008`。
+
+**monitor 不认 `#` 注释**，注释别敲进去（会报 `unknown command: '#'`）。
+
+输出 buffer 的地址是链接期定的（`__PSRAM_BASE`），所以脚本从符号表里读
+`buffer2`，不写死。采样点按区域挑，四个区域的值互不相同：
+
+| 区域 | 采样点 | 期望 |
+|---|---|---|
+| 画布（没被任何图层覆盖） | (10,10) (260,60) | `0x00000000` |
+| 只有前景 | (74,74) (198,74) | `0x00100010` |
+| 只有背景 | (240,124) (148,196) | `0x80008000` |
+| 前景与背景重叠 | (150,124) | `0x80088008` |
+
+蓝和红都是 `0x10`/`0x8000`，即 31 级里的 16 级 ≈ 128/255，alpha 生效了。重叠处
+是 `0x8008`：红盖在蓝上，红得 16 级、蓝被压到 8 级（`16 × 127/255`）。**混合的
+具体取整值取决于模型怎么算，但这四处各不相同就说明图层位置和混合顺序是对的**
+——位置错一个像素，采样点就会落到另一个区域上，值立刻不对。
+
+这一项同时验到了 PSRAM：`.RW_PSRAM_NON_RET` 有 0x868a0 字节，`hello_world`
+里这个段是 0，所以第 8 项从来没碰过 PSRAM。顺带也验了 EPIC 的两条地址通路
+——`AHB_MEM` 走 CPU 地址、图层 `SRC` 走 SBUS 别名，见 `peripherals.md` §8.2。
+
 ### ③ 代码格式
 
 ```bash
@@ -224,7 +305,11 @@ SIFLI_REAL_FW=/path/to/main.elf bash notes/verify-sifli.sh   # 换固件
 SIFLI_REAL_FW=- bash notes/verify-sifli.sh       # 跳过固件那一项
 ```
 
-八项检查，全部通过退出码 0，可直接进 CI：
+第 9、10 项各自要一个例程固件，路径不合适就用 `SIFLI_EZIP_FW=` / `SIFLI_EPIC_FW=`
+覆盖（`SIFLI_EZIP_TOOL=` 指宿主的 `ezip_linux`）；固件或工具不在就整项 `[SKIP]`，
+不会假装通过。
+
+十项检查，全部通过退出码 0，可直接进 CI：
 
 | # | 检查 | 性质 |
 |---|---|---|
@@ -236,17 +321,22 @@ SIFLI_REAL_FW=- bash notes/verify-sifli.sh       # 跳过固件那一项
 | 6 | 外设区域都映射了，寄存器读回值正确 | 结构性 |
 | 7 | 外设写路径（qtest） | 结构性 |
 | **8** | **真实板子固件跑到 `main()` 和 msh 提示符** | **真正的验收** |
+| 9 | EZIP 例程四条解码与资产逐字节一致 | 结果正确性 |
+| 10 | EPIC 例程混合出来的像素对 | 结果正确性 |
 
 **第 8 项才是关键。** 第 6、7 项只是读几个寄存器，**模型写错了它们照样能过**
-——`peripherals.md` §7.2 那个 DWT 映射错位的坑就骗过了它们全部。只有 SDK 原样
+——`peripherals.md` §10.2 那个 DWT 映射错位的坑就骗过了它们全部。只有 SDK 原样
 构建的真实板子固件、一行不改地跑到 `main()`，才能证明整个 HAL 真的在模型上跑
-起来了——时钟树、电源、RTC、MPI、音频、控制台，整条链路。
+起来了——时钟树、电源、RTC、MPI、音频、控制台，整条链路。第 9、10 项再用例程
+自带的结果验一遍**算得对不对**。
 
 不跑脚本时手工至少查这几条：
 
 ```
 □ 两个二进制的 -M help 都能看到 sf32lb52x
 □ 真实板子固件能跑出 "Hello world!" 和 msh 提示符（不带 -semihosting）
+□ ezip 例程四句 [EZIP]Output is correct.
+□ epic 例程打 "EPIC blend succeeded"
 □ checkpatch 0 errors 0 warnings
 □ git ls-files --eol 显示 w/lf（不是 w/crlf）
 □ git diff --stat 只有自己的改动
@@ -324,6 +414,24 @@ memory=16GB
 
 上游 `subprojects/.gitignore` 列了所有 wrap 子项目，**唯独漏了 `libblkio`**。
 不影响构建（我们没开 libblkio），是纯噪音。
+
+### ⑦ SDK 在 drvfs 上时 `source export.sh` 会卡很久
+
+SDK 放在 `/mnt/e`（WSL 的 drvfs，实际是 Windows 盘）上时，`source export.sh`
+要几十秒到几分钟才返回——构建系统会对整棵树做 `git status`，而 drvfs 上每个
+文件的 `stat` 都要过一遍 9P，慢在这里。
+
+临时绕开，让 git 别去比 `stat`（只影响这一次构建）：
+
+```bash
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=core.checkStat
+export GIT_CONFIG_VALUE_0=minimal
+source export.sh
+```
+
+实测从"几分钟"降到 **26 秒**。或者把 SDK 放到 WSL 自己的文件系统里（`~/code/`），
+那就不用管这一条了。
 
 ---
 
