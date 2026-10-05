@@ -273,6 +273,37 @@ if ($realfile =~ /.*\/hw\/.*/ && $line =~ /\bqemu_bh_new(_guarded)?\s*\(/) {
 - `WARNING: Block comments use a leading /* on a separate line` —— QEMU 要求多行块注释的
   `/*` 和 `*/` **各占一行**（不能写成 `/* 正文… */`）
 
+**写寄存器掩码时别用 SDK 的 `_Pos`/`_Msk` 命名。** SDK 的头文件长这样：
+
+```c
+#define EPIC_L0_CFG_ALPHA_Pos   5
+#define EPIC_L0_CFG_ALPHA_Msk   (0xff << 5)
+```
+
+`ALPHA_Pos` 这类名字会被 checkpatch 认成**类型名**——它的 `$typeTypedefs` 里有
+一条驼峰启发式 `[A-Z][A-Z\d_]*[a-z][A-Za-z\d_]*`（大写串后面跟小写字母），
+SDK 的名字正好都长这样。结果 `(cfg >> EPIC_L0_CFG_ALPHA_Pos) & 0xff` 会被
+当成"类型后面跟了个 `&`"：
+
+```
+ERROR: space prohibited after that '&' (ctx:WxW)
+```
+
+**是假报错，而且只在这一种写法上出现**：checkpatch 的 `)` 会把
+`@av_paren_type` 弹掉，但**只在弹出的值不是 `'_'` 时才重置 `$type`**，所以
+括号里的最后一个 token 决定了括号外的类型判断。QEMU 自己的宏全是大写，踩不到。
+
+照 SDK 的移位掩码约定写就能绕开——`_Msk` 定义成**已经移好位**的：
+
+```c
+#define EPIC_L0_CFG_ALPHA_Pos   5
+#define EPIC_L0_CFG_ALPHA_Msk   (0xffu << 5)
+/* 取值一律 (v & Msk) >> Pos */
+```
+
+`Msk` 以大写 `M` 开头但不是"大写串+小写"的形状，不触发启发式。两种写法结果
+一样，SDK 的头文件本身就是这个约定。
+
 ### ④ 属性生效
 
 ```bash
