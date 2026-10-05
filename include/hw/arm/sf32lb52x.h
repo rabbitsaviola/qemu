@@ -65,6 +65,9 @@
  * the flash one: -M sf32lb52x,psram-size=... The default is what the boards
  * currently in the SDK carry and what their linker scripts lay out data in
  * (__PSRAM_BASE 0x60400000, 4 MB of it).
+ *
+ * Firmware puts its LCD framebuffer here too: a 390x450 RGB888 screen is
+ * 514 KiB, which does not fit in the 512 KiB of on-chip RAM.
  */
 #define SF32LB52X_PSRAM_BASE        0x60000000ULL
 #define SF32LB52X_PSRAM_SIZE        (16 * MiB)
@@ -94,6 +97,7 @@
 #define SF32LB52X_GPIO1_BASE        0x500a0000ULL
 #define SF32LB52X_GPIO2_BASE        0x40080000ULL
 #define SF32LB52X_I2C1_BASE         0x5009c000ULL
+#define SF32LB52X_LCDC1_BASE        0x50008000ULL
 #define SF32LB52X_SPI1_BASE         0x50095000ULL
 #define SF32LB52X_EZIP1_BASE        0x50006000ULL
 #define SF32LB52X_EPIC_BASE         0x50007000ULL
@@ -279,6 +283,7 @@ extern const unsigned sf32lb52x_num_usarts;
 #define SF32LB52X_IRQ_EZIP          89
 #define SF32LB52X_IRQ_I2C3          93
 #define SF32LB52X_IRQ_USART3        95
+#define SF32LB52X_IRQ_LCDC1         63
 /* CRC has no interrupt line on this series. */
 
 /*

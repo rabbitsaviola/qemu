@@ -35,6 +35,7 @@
 #include "hw/char/sifli-usart.h"
 #include "hw/display/sifli-epic.h"
 #include "hw/display/sifli-ezip.h"
+#include "hw/display/sifli-lcdc.h"
 #include "hw/dma/sifli-dma.h"
 #include "hw/misc/armv7m_dwt.h"
 #include "hw/misc/sifli-regbank.h"
@@ -204,6 +205,9 @@ static void sifli_sf32lb52x_init(MachineState *machine)
      * through registers the RCC/MPI banks already answer; once the firmware
      * believes it is up, what it does with the memory is ordinary loads and
      * stores.
+     *
+     * The firmware's LCD framebuffer lands here too -- at 0x60400000 on the
+     * a128r16 board, which is why the region starts at 0x60000000.
      */
     memory_region_init_ram(&s->psram, NULL, "sifli.psram",
                            s->psram_size, &error_fatal);
@@ -394,6 +398,24 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(ezip), 0, SF32LB52X_EZIP1_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(ezip), 0,
                            qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_EZIP));
+    }
+
+    /*
+     * The LCD controller. Its panel is not built here: a panel is a part of
+     * the board rather than of the SoC, so it is whatever "-device
+     * sifli-panel" the user passed, and it attaches itself to this device's
+     * QSPI bus when it realizes. Without one the controller still runs and
+     * still draws, sized from the layer's own rectangle, but the panel ID
+     * read comes back zero and the firmware will not recognise the screen.
+     */
+    {
+        DeviceState *lcdc = qdev_new(TYPE_SIFLI_LCDC);
+
+        object_property_add_child(OBJECT(machine), "lcdc", OBJECT(lcdc));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(lcdc), 0, SF32LB52X_LCDC1_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(lcdc), 0,
+                           qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_LCDC1));
     }
 
     /*

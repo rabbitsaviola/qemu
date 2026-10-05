@@ -110,6 +110,8 @@ config SIFLI_SF32LB52X
     select SIFLI_REGBANK
     select SIFLI_EPIC
     select SIFLI_EZIP
+    select SIFLI_LCDC
+    select SIFLI_PANEL
 
 config MPS3R
     bool

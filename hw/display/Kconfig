@@ -155,3 +155,10 @@ config SIFLI_EPIC
 
 config SIFLI_EZIP
     bool
+
+config SIFLI_LCDC
+    bool
+    depends on PIXMAN
+
+config SIFLI_PANEL
+    bool
