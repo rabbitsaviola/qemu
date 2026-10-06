@@ -117,6 +117,11 @@ void sifli_regbank_set_clock(SifliRegBankState *s, Clock *clk)
     s->clk = clk;
 }
 
+void sifli_regbank_set_peer(SifliRegBankState *s, SifliRegBankState *peer)
+{
+    s->peer = peer;
+}
+
 /* Used by the alias redirection in sifli_regbank_write(). */
 static void sifli_regbank_set_bits(SifliRegBankState *s, uint32_t off,
                                    uint32_t bits)
@@ -158,6 +163,14 @@ static uint64_t sifli_regbank_read(void *opaque, hwaddr addr, unsigned size)
         v = 0;
     } else {
         v = (s->regs[i] | r->force1) & ~r->force0;
+    }
+
+    /*
+     * Last, because a counter's value replaces all of the above rather than
+     * adding to it.
+     */
+    if (s->def->read_hook) {
+        s->def->read_hook(s, r->off, &v);
     }
 
     return extract32(v, (addr & 3) * 8, size * 8);

@@ -286,11 +286,20 @@ static void sifli_sf32lb52x_init(MachineState *machine)
      * they are table-driven: one sifli-regbank device per block, told which
      * table to use and where to live. The tables are in sf32lb52x-periph.c.
      */
+    SifliRegBankState *aon = NULL, *rtc = NULL;
+
     for (i = 0; i < sf32lb52x_num_reg_banks; i++) {
         const Sf32lb52xRegBank *b = &sf32lb52x_reg_banks[i];
         DeviceState *dev = qdev_new(TYPE_SIFLI_REGBANK);
 
         qdev_prop_set_string(dev, "bank", b->bank);
+
+        /* Kept for the peer link just after the loop. */
+        if (!strcmp(b->bank, "sf32lb52x.hpsys_aon")) {
+            aon = SIFLI_REGBANK(dev);
+        } else if (!strcmp(b->bank, "sf32lb52x.rtc")) {
+            rtc = SIFLI_REGBANK(dev);
+        }
 
         /*
          * Every bank is offered the system clock; only the RCC has a hook
@@ -303,6 +312,14 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, b->base);
     }
+
+    /*
+     * The AON's GTIMR counts whichever low-power clock the RTC selected, so
+     * its read hook has to see RTC_CR.LPCKSEL -- a register in the RTC bank
+     * rather than in the AON one. Link the two; see the comment above
+     * sf32lb52x_gtimr_hz().
+     */
+    sifli_regbank_set_peer(aon, rtc);
 
     /*
      * Both DMA controllers, with all eight channels of each.

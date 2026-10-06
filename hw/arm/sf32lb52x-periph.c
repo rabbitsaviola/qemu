@@ -36,7 +36,9 @@
 #include "hw/arm/sf32lb52x.h"
 #include "hw/misc/sifli-regbank.h"
 #include "qemu/bitops.h"
+#include "qemu/host-utils.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 
 /* HPSYS_RCC register offsets */
 enum {
@@ -389,6 +391,59 @@ static const SifliRegDef sf32lb52x_hpsys_cfg_regs[] = {
     { .off = HPSYS_CFG_CAU2_RSVD },
 };
 
+#define HPSYS_AON_GTIMR     0x34
+
+/* RTC_CR bit 0: set selects the 32 kHz crystal, clear the ~10 kHz RC. */
+#define RTC_CR_LPCKSEL      BIT(0)
+
+/*
+ * GTIMR is a free-running up-counter with no control bits of its own, so its
+ * rate is the only thing to get right -- and the rate is not fixed. It counts
+ * whichever low-power clock the RTC has selected, and that is RTC_CR.LPCKSEL:
+ * set means the 32 kHz crystal, clear means the ~10 kHz RC.
+ *
+ * The bit is not merely a detail of the counter, because HAL_GetTick() picks
+ * its conversion from the same bit (drv_common.c:328, via HAL_LXT_ENABLED()):
+ * t * 1000 / 32768 on the crystal (:360), t / 10 on the RC (:342). A counter
+ * running at one rate while the firmware divides by the other makes every HAL
+ * timeout in the SDK wrong by the ratio -- the touch driver's I2C waits are
+ * the first to care, and on this model they are what turns an unmodelled bus
+ * into a hung board rather than a clean HAL_TIMEOUT.
+ *
+ * LPCKSEL is clear on reset, so a machine whose firmware never touches the
+ * RTC reports the RC rate. That is what the hardware does too.
+ *
+ * The calibrated RC path is deliberately not modelled: when the RC is
+ * selected and the firmware holds a stored calibration value, HAL_GetTick()
+ * divides by the calibrated frequency rather than 10 kHz (drv_common.c:351).
+ * Nothing here produces that value, and the firmware this model is checked
+ * against runs on the crystal.
+ *
+ * Ticks come from the virtual clock rather than a timer: the answer has to be
+ * current at the instant of the read, and the alternative is 32768 timer
+ * wake-ups a second to keep a register nobody polls.
+ */
+#define HPSYS_AON_GTIMR_LXT_HZ      32768
+#define HPSYS_AON_GTIMR_RC10K_HZ    10000
+
+static uint32_t sf32lb52x_gtimr_hz(SifliRegBankState *s)
+{
+    if (s->peer && (sifli_regbank_reg(s->peer, RTC_CR) & RTC_CR_LPCKSEL)) {
+        return HPSYS_AON_GTIMR_LXT_HZ;
+    }
+
+    return HPSYS_AON_GTIMR_RC10K_HZ;
+}
+
+static void sf32lb52x_hpsys_aon_read(SifliRegBankState *s, uint32_t off,
+                                     uint32_t *value)
+{
+    if (off == HPSYS_AON_GTIMR) {
+        *value = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                          sf32lb52x_gtimr_hz(s), NANOSECONDS_PER_SECOND);
+    }
+}
+
 /*
  * The always-on blocks hold the 48 MHz and 32 kHz clock controls and the
  * wake-up sources. Nothing here is polled except the clock-ready flags and
@@ -423,7 +478,8 @@ static const SifliRegDef sf32lb52x_hpsys_aon_regs[] = {
     { .off = 0x2c, .force1 = BIT(4) | BIT(5) },
 
     { .off = 0x30 },                    /* ANACR   */
-    { .off = 0x34 },                    /* GTIMR   */
+    /* GTIMR: free-running, so its value comes from the read hook. */
+    { .off = HPSYS_AON_GTIMR },
     { .off = 0x38 },                    /* RESERVE0 */
     { .off = 0x3c },                    /* RESERVE1 */
 };
@@ -459,7 +515,13 @@ static const SifliRegDef sf32lb52x_lpsys_aon_regs[] = {
     { .off = 0x40, .force0 = BIT(4) },
 
     { .off = 0x44 },                    /* ANACR    */
-    { .off = 0x48 },                    /* GTIMR    */
+    /*
+     * GTIMR, the LCPU's twin of the HPSYS one. Left as storage: only the
+     * LCPU build reaches it. drv_common.c takes HPSYS's copy under
+     * SOC_BF0_HCPU and this one otherwise, and this machine runs the HCPU
+     * firmware.
+     */
+    { .off = 0x48 },
     { .off = 0x4c },                    /* RESERVE0 */
     { .off = 0x50 },                    /* RESERVE1 */
     /* 0x54-0xfc are reserved. */
@@ -752,6 +814,7 @@ static const SifliRegBankDef sf32lb52x_banks[] = {
         .size = 0x40,
         .regs = sf32lb52x_hpsys_aon_regs,
         .nregs = ARRAY_SIZE(sf32lb52x_hpsys_aon_regs),
+        .read_hook = sf32lb52x_hpsys_aon_read,
     },
     {
         .name = "sf32lb52x.lpsys_aon",

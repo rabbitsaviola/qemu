@@ -146,6 +146,25 @@ typedef struct SifliRegBankDef {
      * sifli_regbank_set_reg() to reach the others from the hook.
      */
     bool (*write_hook)(SifliRegBankState *s, uint32_t off, uint32_t value);
+
+    /*
+     * Called with the value a read would otherwise return -- the stored bits
+     * after force1/force0 -- in *value, and may replace it. Write only the
+     * offsets the hook owns; leaving *value alone lets the table's value
+     * stand.
+     *
+     * This exists for the one register whose value is not storage at all: a
+     * free-running counter. Nothing software writes decides what it reads
+     * back, and no periodic update can produce it either -- the answer
+     * changes between any two reads, so it has to be computed when asked.
+     *
+     * GTIMR is why. HAL_GetTick() is that counter scaled to milliseconds
+     * (drv_common.c:320), and every HAL wait loop in the SDK bounds itself
+     * with HAL_GetTick(). Leave the counter frozen and those loops do not
+     * time out, they spin for ever: an unmodelled peripheral turns into a
+     * hung board rather than a clean HAL_TIMEOUT. That is worth a hook.
+     */
+    void (*read_hook)(SifliRegBankState *s, uint32_t off, uint32_t *value);
 } SifliRegBankDef;
 
 struct SifliRegBankState {
@@ -165,6 +184,17 @@ struct SifliRegBankState {
      * use for it simply leave it alone.
      */
     Clock *clk;
+
+    /*
+     * Optional. A second bank whose registers this one's hooks have to read.
+     *
+     * The AON's GTIMR is the reason: it counts the low-power clock, and which
+     * clock that is -- the 32 kHz crystal or the ~10 kHz RC -- is decided by
+     * RTC_CR.LPCKSEL, a register in the RTC bank rather than in the AON one.
+     * The machine links the two after creating both. A bank with no peer
+     * leaves this NULL, and its hooks check before reaching through it.
+     */
+    SifliRegBankState *peer;
 };
 
 /*
@@ -189,5 +219,12 @@ void sifli_regbank_set_reg(SifliRegBankState *s, uint32_t off, uint32_t value);
 
 /* Hand a bank the clock its write hook may drive. Call before realize. */
 void sifli_regbank_set_clock(SifliRegBankState *s, Clock *clk);
+
+/*
+ * Hand a bank another bank whose registers its hooks may read. Call before
+ * realize, or any time after -- the hooks read the peer when they run, not
+ * when it is set. See the peer field above.
+ */
+void sifli_regbank_set_peer(SifliRegBankState *s, SifliRegBankState *peer);
 
 #endif /* HW_MISC_SIFLI_REGBANK_H */
