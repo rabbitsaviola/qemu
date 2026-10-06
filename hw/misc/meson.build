@@ -28,6 +28,7 @@ system_ss.add(when: 'CONFIG_VIRT_CTRL', if_true: files('virt_ctrl.c'))
 
 # SiFli devices
 system_ss.add(when: 'CONFIG_SIFLI_REGBANK', if_true: files('sifli-regbank.c'))
+system_ss.add(when: 'CONFIG_SIFLI_GPIO', if_true: files('sifli-gpio.c'))
 
 # RISC-V devices
 system_ss.add(when: 'CONFIG_MCHP_PFSOC_DMC', if_true: files('mchp_pfsoc_dmc.c'))

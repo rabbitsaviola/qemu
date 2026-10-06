@@ -39,6 +39,7 @@
 #include "hw/dma/sifli-dma.h"
 #include "hw/i2c/sifli-i2c.h"
 #include "hw/misc/armv7m_dwt.h"
+#include "hw/misc/sifli-gpio.h"
 #include "hw/misc/sifli-regbank.h"
 #include "system/system.h"
 #include "system/address-spaces.h"
@@ -419,6 +420,27 @@ static void sifli_sf32lb52x_init(MachineState *machine)
                                             dmas[u->dma_ctrl], "request",
                                             u->dma_rx_req));
         }
+    }
+
+    /*
+     * GPIO1 only. It carries the pins this board's reference firmware acts
+     * on -- the panel and touch resets, and the touch controller's interrupt
+     * line -- and its interrupt registers are the plain ones.
+     *
+     * GPIO2 is a different block in the same shape: on the HCPU its
+     * interrupts arrive through the _EXT registers, which is how the other
+     * core raises one on this, and nothing here needs that yet. Leaving it
+     * unmodelled is what it has always been: reads return zero.
+     */
+    {
+        DeviceState *gpio = qdev_new(TYPE_SIFLI_GPIO);
+
+        qdev_prop_set_uint32(gpio, "num-banks", 2);
+        object_property_add_child(OBJECT(machine), "gpio1", OBJECT(gpio));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, SF32LB52X_GPIO1_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
+                           qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_GPIO1));
     }
 
     /*

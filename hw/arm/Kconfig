@@ -113,6 +113,7 @@ config SIFLI_SF32LB52X
     select SIFLI_LCDC
     select SIFLI_PANEL
     select SIFLI_I2C
+    select SIFLI_GPIO
 
 config MPS3R
     bool

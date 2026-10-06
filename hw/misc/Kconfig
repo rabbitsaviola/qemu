@@ -195,6 +195,9 @@ config MCHP_PFSOC_SYSREG
 config SIFLI_REGBANK
     bool
 
+config SIFLI_GPIO
+    bool
+
 config SIFIVE_TEST
     bool
 
