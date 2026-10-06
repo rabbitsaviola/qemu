@@ -359,8 +359,10 @@ machine 侧是**独立的第二个 Clock**（`systickclk`），接到 systick �
   `RTC_CR.LPCKSEL` 在 32768（晶振）/ 10000（RC）之间变频。这一段原先在
   `verify-sifli.sh` 的第 6 项，搬到 qtest 才进得了 CI（verify 的第 7 项会跑
   qtest-sifli.sh，所以那边的覆盖没丢）。
-- **I2C 仍然没有模型**（I2C1–4 在 `0x5009c000` 起，见 §13.1），所以触摸屏在 QEMU
-  里用不了——只是现在会干净地超时失败，不把系统挂住。验 LCD 用不着它。
+- **当时 I2C 还没有模型**（I2C1–4 在 `0x5009c000` 起），所以触摸屏在 QEMU 里
+  用不了——只会干净地超时失败，不把系统挂住。验 LCD 用不着它。它后来有了
+  （§10），这条链整个跑通了；但上面这个定位过程成立，跟它有没有模型无关——
+  **症状长在 LCD 上，病根在 I2C 上**。
 
 > 日志里 `[152104]` 那样的数字**不是毫秒**：`ulog_get_tick()`
 > （`drv_common.c:750`）直接返回 GTIMR 原值，除以 32768 才是秒。当毫秒读会以为
@@ -949,7 +951,116 @@ NV3041A、SH8603B、SPD2012、FT2308…）。两种情况下"面板返回自己�
 
 ---
 
-## 10. 加一个新外设
+## 10. I2C、GPIO 与触控
+
+CO5300 面板的触控是这条链：**I2C1 → FT6146 → PA31 → GPIO1 → NVIC**。三个模型
+拼出来——`hw/i2c/sifli-i2c.c`（控制器）、`hw/i2c/sifli-ft6146.c`（从机）、
+`hw/misc/sifli-gpio.c`（中断脚）——机器里接起来的线是板级的，不是 SoC 的。
+
+### 10.1 控制器：SR 和 IER 共用位号
+
+四个控制器 I2C1–4，基址和中断号在 `sf32lb52x_i2cs[]`
+（`hw/arm/sf32lb52x-periph.c`）。
+
+HAL 是中断状态机：`SR` 里的一位配上 `IER` 里的同一位就是一次中断，所以两套
+位号是重合的（`drivers/cmsis/Include/i2c.h`），`HAL_I2C_IRQHandler` 读 `SR`、
+和 `IER` 相与、分派、最后把 `SR` 写回去清位。**`SR` 是写 1 清**——"事件发生了"
+和"该不该叫醒 CPU"因此是分开的两件事。
+
+`TCR` 那一个写下去就是**立刻执行**，没有 FIFO、没有时序：
+
+- `START`：`DBR` 里是地址和读写位，去总线上发起一次传输。没人应答置 `BED`。
+- `TB`：收发一个字节。收的时候结果进 `DBR`，置 `RF`。
+- `STOP`（可带 `NACK`）：收尾，置 `MSD`。
+
+`BED` 必须真的置起来。`I2C_WaitOnFlagAndDetectError` 轮的就是它和 `RF`，总线上
+没人应答却不报错的话，固件就在那儿转到超时，而超时在模型上永远不会来。
+`qtest-sifli.sh` 第 [17g] 段钉的就是这个。
+
+`CR.RSTREQ` 是自清的：HAL 写下去，再轮询等它读回 0。
+
+### 10.2 FT6146：寄存器指针要跨过 STOP
+
+从机在 7 位地址 `0x38`。驱动真正读的只有 `TD_STATUS(0x02)` 和 P1 那四个坐标
+字节，一次读 14 个（`read_regs(0x01, 2 + 6 * MAX_POINT_NUM)`，所以下标 1 才是
+`TD_STATUS`）。
+
+**最要紧的一处是指针要跨传输活着。** 驱动分两次传输读：先写指针、STOP，再重新
+START 读。所以指针只在**新的写传输**开头重置，读传输和重复起始都不能碰它
+（`addr_phase` 只在 `I2C_START_SEND`/`I2C_FINISH` 上清）。写成"每次传输都重置"
+的话读回来永远是同一个字节，而现象只是"坐标不对"。
+
+中断线**低有效，并且一直低到主机把状态读走**。主机还没读时再报一次不构成新的
+下降沿——这一条对应的真机现象是触摸事件重复上报。线在 **reset exit** 相里驱到
+空闲的高电平，不是 reset hold：GPIO bank 在自己的 hold 相里清输入电平，两个设备
+的 hold 顺序没有定义，放 hold 里会被冲掉；而线本来就是低的话，第一次触摸就是
+个 0→0、没有边沿可锁。
+
+ID 字节（`0xA3`/`0x9F`）做成 QOM 属性，方便换料。a128r16 上驱动会打
+`ft6146 id_H=0` 的警告然后继续——它不据此失败。
+
+坐标是**原样透传**的：驱动里 `ft6146_correct_pos()`（会把 x 变成 `390 - x`）
+定义了但**从来没被调用**，所以注入什么就读回什么，不是它的镜像。
+
+### 10.3 GPIO：写一个寄存器置位、写另一个清位、读第三个
+
+`0x80` 字节一个 bank，一个 bank 32 根脚。GPIO1 的两个 bank 落在 `0x500a0000`
+和 `0x500a0080`。
+
+HAL 几乎不直接写 `DIR`/`DOR`。它写**别名**：`DOESR`/`DOECR` 管输出使能，
+`IESR`/`IECR` 管中断使能，`ITSR`/`ITCR` 管触发方式，`IPHSR`/`IPHCR` 和
+`IPLSR`/`IPLCR` 管极性——然后读旁边那个"正身"。这四对是 regbank 那套「写 A 清 B」
+的另一种用法（§2.5），模型里就是 W1S/W1C 两种写钩子喂一个回读寄存器。
+
+`ISR` 是**写 1 清**。整个 block 共用一条 NVIC 线（GPIO1 = IRQ 84）：任何 bank 有
+"锁存了且使能了"的位就把线拉起来，全清掉才放下。
+
+脚的电平读回是 `(dor & doer) | (in & ~doer)`——配成输出的脚读回的是自己驱动的
+电平，不是外部的。
+
+只做 GPIO1，而且只做两个 bank：GPIO2 的中断在 HCPU 上走 `_EXT` 那一套寄存器
+（另一个核靠它打断这个核），暂时用不上。
+
+### 10.4 板级接线与验收
+
+**I2C1 和 PA31 是板子的事，不是 SoC 的事**：a128r16 在 `bsp_pinmux.c` 里
+`HAL_PIN_Set(PAD_PA31, GPIO_A31, ...)`，触摸驱动的 `TOUCH_IRQ_PIN` 也是 31。
+所以接在 machine 里，不走命令行——不接的话 SDK 的触摸例程根本跑不起来，接了
+的话不碰 I2C1 的固件一点影响都没有。
+
+验收跑的是 `sf32lb52-lcd_a128r16_hcpu` 的 `example/rt_driver`，SDK 原样构建、
+一行不改，手指从 QMP 的 `qom-set` 注入：
+
+```
+I/TOUCH tp_init: touch screen found driver  2000a7c8, ft6146
+E/drv.ft6146 tp_init: ft6146 id_H=0
+E/drv.ft6146 tp_init: ft6146 id_L=0
+Touch down [120,200]
+Touch down [300,200]
+Touch down [300,400]
+Touch up   [300,400]
+```
+
+注入的是三步（按下 → 移到别处 → 抬起），出来却是四次上报。多出来的那个
+`[300,200]` 不是模型乱报：x 和 y 是两个 QOM 属性，一次只能写一个，而**手指按着
+的时候每写一次就重发一次当前点**（`touch-x`/`touch-y` 在 `touch_down` 为真时报，
+`touch-down` 自己每次都报），所以先写 x 的那一瞬间，报的是新 x 配旧 y。真机上一
+根手指扫过去本来也会连出一串点，驱动只认最新的那个——只是别把这一条当成
+"注入了几次就该有几行"。
+
+> **注入之间别停太久。** 驱动有个 200 ms 的卡点看门狗
+> （`ft6146_check_timer_handler`，100 ms 周期，连着两次没收到新点就
+> `abnormal_recovery`），它会在最后一次坐标上自己合成一个 **UP**。dwell 超过
+> 200 ms 就会多出一行 `Touch up`——那是驱动干的，不是模型。
+
+不用固件也能验：`qtest-sifli.sh` 第 [17] 段把这条链从总线一路走到 NVIC 逐环钉死
+（PA31 空闲高、下降沿锁存、W1C 清位、主机没读走之前不再产生边沿、读走后松开、
+抬起后 TD_STATUS 归零）。这一项要 qtest 和 QMP 两个协议交错，写不成 bash，单独
+放在 `notes/qtest-touch.py`。
+
+---
+
+## 11. 加一个新外设
 
 **纯配置的（GPIO 配置、PINMUX、LPSYS_CFG…）**：
 1. 在 `sf32lb52x-periph.c` 里加一张 `SifliRegDef[]` 表
@@ -967,7 +1078,7 @@ NV3041A、SH8603B、SPD2012、FT2308…）。两种情况下"面板返回自己�
 
 ---
 
-## 11. 真实固件 bring-up 记录
+## 12. 真实固件 bring-up 记录
 
 用 `sf32lb52-lcd_a128r16` 的 `hello_world`（SDK 原样构建，固件一行不改）逐个
 排查出来的。**这些用 `hello_qemu` 那种 semihosting 桩永远发现不了**——它一个
@@ -976,7 +1087,7 @@ HAL 寄存器都不碰。
 排查手法：固件跑起来后从 monitor 采 `info registers` 看 PC，两次采样相同就是
 死循环，再用 `arm-none-eabi-addr2line` 把地址翻回源码行。
 
-### 11.1 DWT 周期计数器（QEMU 的缺口）
+### 12.1 DWT 周期计数器（QEMU 的缺口）
 
 PC 停在 `HAL_Delay_us_`（`bf0_hal.c:407`）：
 
@@ -992,12 +1103,12 @@ bcc.n ...
 `HAL_RCC_HCPU_ConfigHCLK(240)` → `EnableDLL1` → `HAL_Delay_us(10)`。
 
 补了 `hw/misc/armv7m_dwt.c`（和 `armv7m_ras.c` 并列，同挂 `CONFIG_ARM_V7M`）。
-见 §11.2 关于它为什么必须挂进 armv7m 的 container。守卫是
+见 §12.2 关于它为什么必须挂进 armv7m 的 container。守卫是
 `notes/qtest-sifli.sh` 的 [16]：`DWT_CTRL` 能读写（证明那一页真的归我们，
 而不是被 `nvic-default` 吞掉），清过 `DWT_CYCCNT` 之后推一次时钟，计数器
 必须往前走——冻住的话那一项挂。
 
-### 11.2 armv7m container 的优先级陷阱
+### 12.2 armv7m container 的优先级陷阱
 
 把 DWT 映射进 board 的 system memory **不生效**，尽管 `info mtree -f` 里能看到它：
 
@@ -1023,7 +1134,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 **教训**：`info mtree` 会把重叠的两段都列出来，光看它会被骗。要确认一个
 区域真的生效，得实际读写它。
 
-### 11.3 RTC 的 LXT 使能位（分支走错）
+### 12.3 RTC 的 LXT 使能位（分支走错）
 
 越过 DWT 后卡在 `bf0_hal_lrc_cal.c:894`，轮询 BT MAC 的 `RCCAL_RESULT`。
 
@@ -1041,7 +1152,7 @@ public），优先级给 0 —— 高于 `nvic-default` 的 -1。
 把 RTC 块建起来让这一位存住即可，**比为了这一位去建模 BT MAC 便宜得多**，
 也更接近真实板子（板上有 LXT 晶振）。
 
-### 11.4 MPI 的 CALCR.DONE
+### 12.4 MPI 的 CALCR.DONE
 
 `HAL_MPI_OPSRAM_CAL_DELAY`（`bf0_hal_mpi_psram.c:1386`）：写 `CALCR.EN`(bit31)
 启动校准，然后轮询 `CALCR.DONE`(bit8)。和 RCC 的 `HRCCAL1.CAL_DONE` 同型
@@ -1056,7 +1167,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 | `SR.BUSY` bit31 | 忙 | `HAL_FLASH_IS_BUSY()` |
 | `CALCR.DONE` bit8 | 校准完成 | `bf0_hal_mpi_psram.c:1386` |
 
-### 11.5 RTC_ISR 的六个就绪标志
+### 12.5 RTC_ISR 的六个就绪标志
 
 `RTC_EnterInitMode`（`bf0_hal_rtc.c:1009`）置 `ISR.INIT`(bit10) 后等
 `ISR.INITF`(bit9)。把 `bf0_hal_rtc.c` 里所有 `while` 找出来后发现有六个
@@ -1077,7 +1188,7 @@ MPI 整体是行为型设备（要走串行协议），但**启动阶段只需�
 才知道那个分支被 `if (hrtc->Instance->CR & RTC_CR_WUTE)` 保护着，而 WUTE 我们
 从不置位，所以强制置 1 是安全的。**这类冲突必须读代码，猜不出来。**
 
-### 11.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
+### 12.6 AUDPRC 与 AUDCODEC（只列被等的寄存器）
 
 音频这块**故意只建了极少的寄存器**，其余留白：
 
@@ -1105,7 +1216,7 @@ pll_cnt = PLL_CAL_RESULT >> PLL_CNT_Pos;
 
 **先判断循环是否本身有界，再决定要不要伪造终态。**
 
-### 11.7 结果
+### 12.7 结果
 
 `sf32lb52-lcd_a128r16` 的 `hello_world`，SDK 原样构建、一行不改：
 
@@ -1126,7 +1237,7 @@ msh />
 跑到 `main()` 并停在 RT-Thread 的 msh 提示符上。`notes/verify-sifli.sh` 第 9 项
 就是跑这个。
 
-### 11.8 规律
+### 12.8 规律
 
 到目前为止**每一个坑都是同一个形状**：没建模的寄存器读回 0，固件据此做了
 一个真实硬件上不会做的判断，然后走进死循环或错误分支。所以薄模型的重点
@@ -1134,7 +1245,7 @@ msh />
 
 ---
 
-## 12. 排查
+## 13. 排查
 
 **看固件碰了哪些没建模的地址**：
 
@@ -1170,9 +1281,9 @@ grep -n "while\s*(" drivers/hal/bf0_hal_xxx.c
 凡是轮询**硬件**才会置的位的循环，就是需要 `force1` 的地方；凡是 HAL 自己先写再读的
 （比如 `RSTR1 |= x; while (!RSTR1);`），普通存储就够了，不要画蛇添足。
 
-## 13. 待办：还没做、或做了还没验的
+## 14. 待办：还没做、或做了还没验的
 
-### 13.1 模型缺口
+### 14.1 模型缺口
 
 **co-engine 图层的缩放已做，旋转仍未做。** HAL 对 EZIP 图层有两条专属限制，
 都在 `HAL_EPIC_BlendStartEx` 的入口（`bf0_hal_epic.c:6196-6204`）：**不能旋转**
@@ -1192,10 +1303,10 @@ rotation`），以及**两个 EZIP 图层不能一前一后同框**。缩放**�
 `angle`/`scale` 全是默认值（源码注释就写着 "no rotation and scaling"），验的其实
 是 EZIP 解码。
 
-**I2C（I2C1–4，`0x5009c000` 起，见 `drivers/cmsis/sf32lb52x/register.h:387`）
-没有模型**，板子上的触摸屏因此用不了。现在会干净地超时失败，不挂住系统。
+**GPIO2 没有模型。** 只有 GPIO1 做了（§10.3），因为板子的触摸中断脚在它上面。
+GPIO2 的中断在 HCPU 上走另一套 `_EXT` 寄存器，读到的是 0——现在还不需要它。
 
-### 13.2 有模型、但还没有真机证据
+### 14.2 有模型、但还没有真机证据
 
 - **`ezipa_dec`（EZIP 动画中间件）和 LVGL 的两个 GPU 后端没在模型上跑过。**
   真机证据目前只有 `example/hal_example` 的 `example_ezip` 一条（跑法见

@@ -5,13 +5,14 @@
 
 **所有操作都在 WSL 里做**——Windows 侧没有 gcc/meson，编不了。
 
-脚本都在 `notes/` 下（不在 $HOME）：**本地开发**用前四个，**分发产物**用后两个。
+脚本都在 `notes/` 下（不在 $HOME）：**本地开发**用前五个，**分发产物**用后两个。
 
 | 文件 | 用途 |
 |---|---|
 | `build-sifli.sh` | 本地构建（configure 过就跳过，日常只跑 ninja） |
 | `verify-sifli.sh` | 一条命令跑完十一项检查，退出码可直接进 CI |
 | `qtest-sifli.sh` | 单独验外设写路径，被 verify 的第 7 项调用 |
+| `qtest-touch.py` | `qtest-sifli.sh` 的第 [17] 项：触控链，要 qtest 和 QMP 交错 |
 | `peripherals.md` | 外设模型是怎么设计的、怎么加新的 |
 | `build-and-verify.md` | 本文 |
 | `../build-dist.sh` | 构建**可分发的产物**（三平台），见 §6 |
@@ -624,7 +625,7 @@ bash notes/realboard/run.sh
 | 11 | EPIC 例程混合出来的像素对 | 结果正确性 |
 
 **第 9 项才是关键。** 第 6–8 项都够不着 HAL：第 6、7 只读几个寄存器，
-**模型写错了照样能过**——`peripherals.md` §11.2 那个 DWT 映射错位的坑就骗过了
+**模型写错了照样能过**——`peripherals.md` §12.2 那个 DWT 映射错位的坑就骗过了
 它们全部。只有 SDK 原样构建的真实板子固件、一行不改地跑到 `main()`，才能证明
 整个 HAL 真的在模型上跑起来了——时钟树、电源、RTC、MPI、音频、控制台，整条链路。
 第 10、11 项再用例程自带的结果验一遍**算得对不对**。
