@@ -37,6 +37,7 @@
 #include "hw/display/sifli-ezip.h"
 #include "hw/display/sifli-lcdc.h"
 #include "hw/dma/sifli-dma.h"
+#include "hw/i2c/sifli-ft6146.h"
 #include "hw/i2c/sifli-i2c.h"
 #include "hw/misc/armv7m_dwt.h"
 #include "hw/misc/sifli-gpio.h"
@@ -46,6 +47,12 @@
 #include "qom/object.h"
 
 #define TYPE_SIFLI_SF32LB52X_MACHINE MACHINE_TYPE_NAME("sf32lb52x")
+
+/*
+ * The pin the touch controller's interrupt line is muxed to, PA31. It is the
+ * board's TOUCH_IRQ_PIN, not a property of the SoC.
+ */
+#define SIFLI_TOUCH_IRQ_PIN 31
 
 struct Sifli52xMachineState {
     MachineState parent;
@@ -179,6 +186,8 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     DeviceState *armv7m;
     /* Indexed by SF32LB52X_DMA_*, so the USARTs can find their controller. */
     DeviceState *dmas[SF32LB52X_DMA_2 + 1] = { NULL };
+    DeviceState *gpio1 = NULL;
+    I2CBus *i2c1 = NULL;
     unsigned i;
 
     /*
@@ -441,6 +450,7 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, SF32LB52X_GPIO1_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
                            qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_GPIO1));
+        gpio1 = gpio;
     }
 
     /*
@@ -464,6 +474,30 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->base);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            qdev_get_gpio_in(armv7m, c->irq));
+
+        if (i == 0) {
+            i2c1 = SIFLI_I2C(dev)->bus;
+        }
+    }
+
+    /*
+     * The panel's touch controller, on I2C1 with its interrupt line on PA31.
+     * Both of those are board wiring rather than SoC: they are what
+     * customer/boards/sf32lb52-lcd_a128r16 does with bsp_pinmux.c's
+     * HAL_PIN_Set(PAD_PA31, GPIO_A31, ...) and the touch driver's
+     * TOUCH_IRQ_PIN. So it is wired here instead of being left to the command
+     * line -- without it the SDK's touch example cannot run at all, and with
+     * it nothing changes for firmware that never looks at I2C1.
+     */
+    {
+        DeviceState *touch = qdev_new(TYPE_SIFLI_FT6146);
+
+        qdev_prop_set_uint8(touch, "address", SIFLI_FT6146_ADDR);
+        object_property_add_child(OBJECT(machine), "touch", OBJECT(touch));
+        i2c_slave_realize_and_unref(I2C_SLAVE(touch), i2c1, &error_fatal);
+
+        qdev_connect_gpio_out(touch, 0,
+                              qdev_get_gpio_in(gpio1, SIFLI_TOUCH_IRQ_PIN));
     }
 
     /*

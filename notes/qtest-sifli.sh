@@ -19,6 +19,9 @@
 # [13]–[16] 是时基那几件（SysTick / tick clock / GTIMR / DWT），要推时钟，
 # 所以单独走 run_clock()（多一个 -accel qtest），见那里的注释。
 #
+# [17] 是触控链（I2C → FT6146 → GPIO1 → NVIC）：寄存器用 qtest 敲，
+# 手指只能从 QMP 的 qom-set 注入，两个协议要交错，所以拆到 qtest-touch.py。
+#
 # 用法：bash notes/qtest-sifli.sh
 #
 # 环境变量可覆盖：
@@ -914,6 +917,25 @@ i=0
 check 0x0 "DWT_CTRL 复位为 0"
 check 0x1 "DWT_CTRL 可读写（0xe0001000 这一页是我们的）"
 check 0x1 "清 CYCCNT 后推一次时钟，计数器在涨"
+
+echo
+echo "[17] 触控链：I2C 控制器 → FT6146 → GPIO1 → NVIC"
+# 这一项要两个协议：寄存器用 qtest 敲，手指按下去只能从 QMP 的 qom-set 注入
+# （qtest 没有 qom 命令），两个还要交错。写不成 bash，单独放在 qtest-touch.py。
+TOUCH_PY=$(dirname "$0")/qtest-touch.py
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "  [SKIP] 没有 python3"
+elif [ ! -r "$TOUCH_PY" ]; then
+    echo "  [SKIP] 找不到 $TOUCH_PY"
+else
+    out17=$(python3 -I "$TOUCH_PY" "$BUILD" 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "$out17" | grep -E '\[PASS\]|\[17'
+    else
+        echo "$out17"
+        FAILED=$((FAILED + 1))
+    fi
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then
