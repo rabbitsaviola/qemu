@@ -204,14 +204,38 @@ bool (*write_hook)(SifliRegBankState *s, uint32_t off, uint32_t value);
 返回 `true` 表示这次写由钩子接管，表不再处理。钩子里可以用
 `sifli_regbank_set_bits()` / `sifli_regbank_clear_bits()` 够到别的寄存器。
 
-### 2.7 未列出的偏移
+### 2.7 读钩子与 peer：GTIMR 用的两件东西
+
+§2.6 那个钩子管"写进去的副作用"。GTIMR 要的是反过来的那一种：**值根本不是存储**。
+写什么进去都不决定它读回什么，也没有周期性的更新能追上——**两次读之间它本来就该
+变**，所以只能在被读的那一刻算：
+
+```c
+void (*read_hook)(SifliRegBankState *s, uint32_t off, uint32_t *value);
+```
+
+钩子拿到的是"表本来会返回的值"（存位经 force1/force0 之后），可以整个换掉；只改
+自己负责的偏移，别的放着不动。目前只有 GTIMR 一个用户（见 §3.3）。
+
+GTIMR 的速率还得看**另一个 bank** 的寄存器（`RTC_CR.LPCKSEL` 决定数晶振还是
+RC），于是 regbank 有一个可选的 `peer`：machine 在两边都建好之后用
+`sifli_regbank_set_peer()` 接上，**钩子运行时才去读**，不在设置时取值。没有 peer
+的 bank 留 NULL，用之前先判空。
+
+### 2.8 未列出的偏移
 
 读 0，并以 `LOG_GUEST_ERROR` 记一笔。加 `-d guest_errors` 就能看到固件碰了哪些
 没建模的寄存器——这是找"下一步该做什么"的主要手段。
 
 ---
 
-## 3. 时钟耦合：RCC 决定 SysTick
+## 3. 时间基准：RCC、SysTick 和 GTIMR
+
+固件里的"一秒"由三样东西决定：CPU 频率（RCC → SysTick）、SysTick 自己的时钟源
+（tick clock）、以及 `HAL_GetTick()` 读的那个自由计数器（GTIMR）。**三个都得对**，
+而且坏掉的症状都不长在自己身上——下面每小节对应一类。
+
+### 3.1 RCC 决定 SysTick
 
 这是整个模型里唯一一处**跨模块的强耦合**，容易漏。
 
@@ -234,8 +258,15 @@ SDK 自己的启动流程（`HAL_PreInit` → `HAL_RCC_HCPU_ConfigHCLK(240)`）�
 `CSR[1:0]` 切到 DLL1，频率变成 240 MHz。如果 machine 的时钟还停在复位值
 48 MHz，**固件里每一个延时都会变成五倍长**。
 
-所以 RCC 表带钩子，在 `CSR`/`CFGR`/`DLL1CR` 被写时重算并
-`clock_set_hz(s->clk, ...)`。machine 把 `sysclk` 交给每个 bank（只有 RCC 会用它）。
+所以 RCC 表带钩子，在 `CSR`/`CFGR`/`DLL1CR` 被写时重算
+（`sf32lb52x_rcc_update_clocks()`，`hw/arm/sf32lb52x-periph.c:217`）。machine 把
+`sysclk` 交给每个 bank（只有 RCC 会用它）。
+
+**新频率要用 `clock_update_hz()` 发出去，不能用 `clock_set_hz()`。** 后者只把值
+缓存在 clock 对象上，消费者拿到的还是旧值——`clock_set_source()` 只在 clock
+被**连接**时复制一次频率，之后不再管，运行中改频率必须靠 `clock_update_hz()`
+里那下 `clock_propagate()`。用错了不会报错，只是时基一直按连接时的值走，差一个
+比例。这个坑在下面 3.2 真踩过一次。
 
 顺带一个好消息：**频率能自洽**。`HAL_RCC_HCPU_GetDLLFreq()` 从 `DLL1CR` 的
 stage 字段反推（`freq = stg * 24M + 24M`），而 `EnableDLL` 写进去的就是
@@ -244,6 +275,85 @@ stage 字段反推（`freq = stg * 24M + 24M`），而 `EnableDLL` 写进去的�
 
 **USART 的波特率反而不用管**：`SystemFixClock` 是编译期常量 48 MHz
 （`bf0_hal.h:198`），BRR 由它算出来，和 RCC 寄存器无关。
+
+### 3.2 tick clock：SysTick 的另一个时钟源
+
+52 系列上 SysTick **不一定要**拿 HCLK 当基准。固件在 `rt_hw_systick_init`
+（`drv_common.c:126`）里按编译期开关挑时钟源，a128r16 这份走的是高精度那条：
+
+```c
+HAL_RCC_HCPU_ClockSelect(RCC_CLK_MOD_HP_TICK, RCC_CLK_TICK_HRC48); /* CSR[14:13]=2 */
+HAL_Delay_us(200);
+HAL_RCC_HCPU_SetTickDiv(60);                                      /* CFGR[21:16]=60 */
+HAL_SYSTICK_Config(800000 / RT_TICK_PER_SECOND);                  /* LOAD=799, 1 ms */
+HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_TICK_CLK);          /* refclk，不是 HCLK */
+```
+
+48 MHz / 60 = 800 kHz。另两条分支（`BSP_PM_FREQ_SCALING` 用 `32768 / 2`，都没定义
+时用 HCLK，`drv_common.c:144-158`）不需要模型额外做什么，但**说明这个频率是固件
+选的、不是固定的**——所以模型得按寄存体现算（3.1 那个钩子里一并算），固件启动时
+走一遍这棵树、每次 PM 变频再走一遍，钉死常数会在第一次变频后悄悄对不上。
+machine 侧是**独立的第二个 Clock**（`systickclk`），接到 systick 的 `refclk`。
+
+链路上两个坑：
+
+1. **`refclk` 没接。** `hw/arm/armv7m.c:463` 只在 `refclk` 有源时才把它转给
+   systick；没有源时 QEMU 反过来**强制** `SYST_CSR.CLKSOURCE=1`
+   （`hw/timer/armv7m_systick.c:143`、`:207`），于是 SysTick 去数 CPU 时钟而不是
+   那 800 kHz。症状是**帧循环快了几十倍**——实测帧间隔 0.13 秒，固件要的是 3 秒。
+   固件确实选的是 `refclk`：它写完 CMSIS 的 `CLKSOURCE=1` 之后又用一次读改写把
+   bit2 清掉（trace 里 `CTRL=0x7`，随后 `CTRL=0x10003`）。
+2. **`clock_set_hz()` 不传播**（见 3.1）。用错了不报错，SysTick 一直按连接时的值
+   走。中间试出过一版量到 **41/s**，正好是 32768/800——即 tick clock 从头到尾
+   停在 LXT 上，而不是那 800 kHz。
+
+另外得连上游一起补一处：`systick_cpuclk_update()` / `systick_refclk_update()`
+（`hw/timer/armv7m_systick.c:217`、`:231`）里那两个 `if` 原本只有注释、**没有
+`return;`**，注释写的是"可以忽略另一路时钟的变化"，代码却照样把周期改成自己那
+一路——于是**后变的那个时钟赢**。上游没暴露是因为真板子的时钟一般启动后就定了，
+而模型会在运行中重调两路。补上之后只有被 `CLKSOURCE` 选中的那一路能改周期。
+
+改完实测：45 秒里 14 帧 `Fill framebuffer`、8 行 `__main loop__`，正是
+`mdelay(3000)` / `mdelay(5000)` 在 1 kHz 下的样子（坏着的时候 20 秒才 1 帧）。
+
+### 3.3 GTIMR：`HAL_GetTick()` 的自由计数器
+
+`HAL_GetTick()`（`drv_common.c:322`）读 `HPSYS_AON.GTIMR`（`0x500c0034`），一个
+自由计数器，按 `t * 1000 / 32768` 折成毫秒（`:357`）。**它必须真的在走**——
+当普通寄存器存着（永远读回定值）时 `HAL_GetTick() - Tickstart` 恒为 0，SDK 里
+**每一个** HAL 超时都永不触发，等待循环从"超时报错"变成**死循环**。
+
+第一次跑 `example/rt_driver` 就撞上了：串口停在 `msh />`、`__main loop__` 一行
+不出、16 张 `screendump` 全黑，而 `-d guest_errors` 里**一条 LCDC/QSPI 的报错都
+没有**（只有音频那几个未建模偏移）。看着像 LCD 坏了，其实跟 LCD 无关：
+
+- **定位靠 PC/LR 而不是猜**：`info registers` 看到 PC 在 `HAL_GetTick`、LR 在
+  `I2C_WaitOnFlagAndDetectError`；再从 `rt_current_thread`（`0x2000d29c`）读 TCB、
+  扫栈上的 flash 返回地址做 addr2line，拿到 `tp_init_thread_entry`
+  （`drv_touch.c:489`）→ ft6146 `init` → `read_regs` → `rt_i2c_transfer`。
+  **是触摸屏初始化在等 I2C。**
+- **屏幕为什么跟着黑**：`tp_init` 是优先号 12 的线程，自旋不让出；优先号 15 的
+  `main` 一直就绪但轮不到，优先号 30 的 `lcd_refr` 更不用想——所以 LCD 那边一行
+  日志都没有。**同一个模型问题，症状长在一个完全无关的外设上。**
+- **修法**：GTIMR 不再是普通寄存器，改成**读钩子现算**
+  （`sf32lb52x_hpsys_aon_read()`，`hw/arm/sf32lb52x-periph.c:502`），值就是
+  `muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), hz, NANOSECONDS_PER_SECOND)`。
+  两个机制见 §2.7。**不用 timer 是有意的**：要让 32768 次/秒的唤醒去喂一个
+  没人轮询的寄存器，不如读的时候算一次——反正两次读之间它本来就该变。
+- **速率不是常数**：`sf32lb52x_gtimr_hz()`（`:493`）按 `RTC_CR.LPCKSEL` 在晶振
+  32768 和 RC 10000（`HPSYS_AON_GTIMR_LXT_HZ` / `_RC10K_HZ`，`:490`）之间选。
+  这个位在 **RTC bank**、不在 AON bank，靠 regbank 的 `peer` 链过去（§2.7）。
+  复位时 LPCKSEL 为 0，报 RC 速率——和硬件一致。
+- **故意不做的**：RC 那条路还有个分支，固件存了校准值就按校准频率除而不是除以
+  10k（`drv_common.c:351`），模型不产生那个值；对着验的固件跑在晶振上。
+- **回归检查**：`notes/verify-sifli.sh` 第 6 项查它"在计数"，并跟着
+  `RTC_CR.LPCKSEL` 在 32768（晶振）/ 10000（RC）之间变频。
+- **I2C 仍然没有模型**（I2C1–4 在 `0x5009c000` 起，见 §13.1），所以触摸屏在 QEMU
+  里用不了——只是现在会干净地超时失败，不把系统挂住。验 LCD 用不着它。
+
+> 日志里 `[152104]` 那样的数字**不是毫秒**：`ulog_get_tick()`
+> （`drv_common.c:750`）直接返回 GTIMR 原值，除以 32768 才是秒。当毫秒读会以为
+> 固件快了几十倍。
 
 ---
 
@@ -444,8 +554,9 @@ vCPU 停住几十毫秒。只有私有格式走这条路。工具路径没给或
 （`bf0_hal_ezip.c:288-324`），列在 bit31:16、行在 bit15:0。硬件只解这一块矩形
 ——图层被画布裁掉时用不着整幅图。模型这边宿主工具总会吐整幅，所以按窗口裁。
 窗口原点是源图的 `(start_col, start_row)`，而图层的 `TL_POS` 是源图 `(0,0)`
-落画布的位置，于是帧落在 `TL_POS + 窗口原点`。（没有旋转缩放：HAL 对 EZIP
-图层拒绝这两样，`bf0_hal_epic.c:6200`。）
+落画布的位置，于是帧落在 `TL_POS + 窗口原点`。（这里假定图层不旋转也不缩放——
+模型两者都没实现，§7.5；HAL 那边至少拒绝 EZIP 图层的旋转，
+`bf0_hal_epic.c:6200`，缩放不拒。）
 
 **像素按 ARGB8888 喂给 EPIC。** HAL 把 EZIP 图层的格式一律折成
 `EPIC_L0_CFG_FMT_ARGB8888`（`bf0_hal_epic.c:722`），而工具产出的是
@@ -965,3 +1076,38 @@ grep -n "while\s*(" drivers/hal/bf0_hal_xxx.c
 
 凡是轮询**硬件**才会置的位的循环，就是需要 `force1` 的地方；凡是 HAL 自己先写再读的
 （比如 `RSTR1 |= x; while (!RSTR1);`），普通存储就够了，不要画蛇添足。
+
+## 13. 待办：还没做、或做了还没验的
+
+### 13.1 模型缺口
+
+**co-engine 图层带缩放或旋转仍不画。** §7.5 那一类（缩放和旋转对所有图层都不
+实现）叠上 EZIP 通道，正好是 `example/rt_device/gpu/single_mode` 的 EZIP demo：
+`src/main.c:186` 设 `EPIC_INPUT_EZIP`，`:180` 和 `:197-198` 又设
+`scale_x/scale_y = 1024 * multiple`。所以那个工程在模型上看不到正确结果。它是
+现成唯一的"EZIP 图层 + 缩放"样本，要动这块就拿它当验收。
+
+HAL 自己对 EZIP 图层有两条专属限制，都在 `HAL_EPIC_BlendStartEx` 的入口
+（`bf0_hal_epic.c:6194-6203`）：**不能旋转**（`rot_cfg->angle != 0` 直接
+`RETURN_ERROR`，注释写着 `don't support ezip rotation`），以及**两个 EZIP 图层
+不能一前一后同框**。缩放**不在**拒绝之列——它和别的图层一样走比例通道
+（`bf0_hal_epic.c:2831` 那段的 `scale_x/scale_y`），所以 `single_mode` 那个
+"EZIP + 缩放"的 demo 在真机上合法，只是模型画不出来（§7.5）。
+
+**I2C（I2C1–4，`0x5009c000` 起，见 `drivers/cmsis/sf32lb52x/register.h:387`）
+没有模型**，板子上的触摸屏因此用不了。现在会干净地超时失败，不挂住系统。
+
+### 13.2 有模型、但还没有真机证据
+
+- **`ezipa_dec`（EZIP 动画中间件）和 LVGL 的两个 GPU 后端没在模型上跑过。**
+  真机证据目前只有 `example/hal_example` 的 `example_ezip` 一条（跑法见
+  `notes/build-and-verify.md` 的 `example_ezip` 小节）。这几个才是真正的下游：
+  `middleware/ezipa_dec/ezipa_dec.c:237`、`middleware/lvgl/lv_drivers/lv_gpu.c:115`、
+  `middleware/lvgl/lv_drivers_v9/sifli/lv_draw_epic_img.c:212` 都设
+  `EPIC_INPUT_EZIP`。
+- **显示通路没在真的 SDL 窗口里用眼睛看过。** 像素是 `-display none` +
+  `screendump` 解 PPM 验的（`notes/build-and-verify.md` §2③），窗口本身没开过。
+- **macOS / Windows 的 SDL 路径只在 CI 里编过，没跑过。** 2026-10-06 的 CI
+  三个平台全绿，链接和 smoke test 都过了，但 smoke test 只跑 `--version` 和
+  `-M help`，不开窗——"编得过"和"窗口出得来"是两回事
+  （`notes/build-and-verify.md` §6）。

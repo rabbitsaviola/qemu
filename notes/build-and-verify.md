@@ -237,6 +237,110 @@ xp /1wx 0x60417afc
 里这个段是 0，所以第 9 项从来没碰过 PSRAM。顺带也验了 EPIC 的两条地址通路
 ——`AHB_MEM` 走 CPU 地址、图层 `SRC` 走 SBUS 别名，见 `peripherals.md` §8.2。
 
+#### `example_ezip` 用例 —— co-engine（EZIP 解压直接喂 EPIC）
+
+上面两个例子都**不走**这条配对：`example/hal/ezip` 只做
+`HAL_EZIP_OUTPUT_AHB`，`example/hal/epic` 的图层全是 `EPIC_COLOR_RGB565`
+（`src/main.c:109/125/146`）。真正走到 `EPIC_ConfigEzipDec` 的是
+`example/hal_example` 里的 `example_ezip` 用例——`fg_img.color_mode =
+EPIC_COLOR_EZIP`，而且它**自带期望资产、逐像素比对**（`cmp_data()`），
+画错一个像素就过不去。
+
+```bash
+cd <SDK>/example/hal_example/project
+scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+```
+
+这个工程是个 utest 容器，`main()` 只挂机，用例从串口敲进去。**stdin 那头要一直
+开着**（用 FIFO，别让 chardev 在 EOF 上被摘掉）。注意**它的提示符是 `msh >`，
+不是 `msh />`**——提示符来自 `finsh_get_prompt()`，两个固件给的不一样，照抄
+hello_world 那条会一直等下去：
+
+```bash
+fifo=$(mktemp -u); log=/tmp/ezip.log; mkfifo "$fifo"; exec 3<>"$fifo"
+./qemu-system-arm -M sf32lb52x,ezip-tool=<SDK>/tools/png2ezip/ezip_linux \
+    -display none -serial stdio -monitor none \
+    -kernel <SDK>/example/hal_example/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf \
+    < "$fifo" > "$log" 2>&1 &
+# 等 "msh >" 出现（启动要几十秒）之后：
+printf 'utest_run example_ezip\r\n' > "$fifo"
+```
+
+期望：
+
+```
+[----------] [ testcase ] (example_ezip) started
+blending done
+check done
+blending done
+check done
+[  PASSED  ] [ result   ] testcase (example_ezip)
+[==========] [ utest    ] Total: 1, Fail: 0
+```
+
+用例跑两遍混合：整幅 88×88 @(10,5)，和裁到 40×50 的那半幅——第二遍验的正是
+窗口裁剪（`EPIC_CalcDecImgArea` 把窗口缩到可见部分）。
+
+**不给 `ezip-tool=` 时这一项必须干净地失败**（`Total: 1, Fail: 1`，几秒内退出），
+不能挂住。EPIC 清"EZIP 在跑"的标志只在完成回调里做、回调只在 END 时调，所以
+输出给 EPIC 的作业报错误位会把固件钉死在 `while (epic->coeng_state)`。
+这是模型上真踩过的坑，见 `peripherals.md` §6.5。
+
+#### `example/rt_driver` —— 整条显示链路
+
+前面几项各钉一个环节；这一项走完整条**显示**链路：HAL 读数 → 驱动认屏 → PSRAM
+落点 → LCDC 出帧。跑法见下面 ③（它就是要 SDL 的那个固件），这里记**答案**。
+
+```bash
+cd <SDK>/example/rt_driver/project
+scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+```
+
+串口三行，各钉一个独立环节（`\r\n` 已省）：
+
+```
+CO5300_ReadID 0x331100
+Lcd info w:390, h450, bits_per_pixel 16, draw_align:2
+Fill framebuffer addr=0x60400000, w=390, h=450, size=351000(Bytes)
+```
+
+| 那行 | 证明 | 出处 |
+|---|---|---|
+| `CO5300_ReadID 0x331100` | LCDC 读数通路通 + 面板真的挂上了 | `co5300.c:295` |
+| `Lcd info w:390, h450, …` | 驱动认出了屏 | `rt_driver/src/main.c:330` |
+| `Fill framebuffer addr=0x…` | PSRAM 映射对，固件在刷屏 | `main.c:353` |
+
+两个容易看错的点：
+
+- **`h450` 没有冒号**——固件自己的格式串（`"h%d"`）就是这样，不是你眼花。
+- **`size=351000` = 390 × 450 × 2**（RGB565）。`main.c:286` 那句注释写着"PSRAM 板上
+  用 RGB888"是**过期的**，两个 `#ifdef` 分支的 `#define` 其实都是 RGB565——别信
+  注释，看 `FB_PIXEL_BYTES`。
+- `addr` 是**链接期**定的，随板和链接脚本走（dpi-hdk 落在 `0x62040000`，a128r16
+  是 `0x60400000`），落在 PSRAM 区（`0x60000000`–`0x63000000`）就对。要从 ELF 里
+  核：`arm-none-eabi-nm <elf> | grep framebuffer`。
+
+之后**每 3 秒**重复一行 `Fill framebuffer`，另有**每 5 秒**一行 `__main loop__`
+（主循环的存活信号）。这两个周期是时间基准的判据，见 `peripherals.md` §3——
+tick 修好之前 45 秒只出一帧。
+
+屏幕是整屏换帧、七帧循环（`main.c:354-361`），顺序是答案的一部分：
+
+| 帧 | 画面 |
+|---|---|
+| 0 | 8 段横向渐变彩条 |
+| 1 | 纵向灰度渐变 |
+| 2–6 | 纯红 → 绿 → 蓝 → 白 → 黑 |
+
+没有窗口时用 `screendump` 取证（③ 的排查表最后两行分别对应 GTIMR 和 tick clock）。
+**注意 PPM 的行距不是 `宽 × 3`**，390 像素时是 1172——见 §5，按 1170 解会从第二行
+起逐行错位。
+
+取一整轮循环：每 1.5 秒一张、连取 16 张，正好盖住 7 帧 × 3 秒 = 21 秒。**判据是
+顺序**（0→6 再回到 0），不是单张长什么样——tick 坏着的时候帧长会被拉到 70 多秒，
+1.5 秒的间隔根本追不上，取样顺序是乱的。顺带：每帧占两张是这个取样的自然结果，
+不是画面在抖。
+
 ### ③ 看画面
 
 **必须带 `-device sifli-panel`**，否则 LCDC 不知道该画多大、驱动也认不出屏
@@ -258,6 +362,17 @@ WSL 里 `DISPLAY=:0` 由 WSLg 提供，不用额外配置。换屏是换命令�
 就是自动化的这一条）→ 串口有没有 `CO5300_ReadID 0x331100` → 有没有
 `Fill framebuffer addr=`。三者依次对应读数路径、`-device` 有没有给、固件有没有
 真的在刷屏。
+
+还有两种**跟 LCD 无关**的坏法，症状却长在屏幕上，`-d guest_errors` 里一条
+LCDC/QSPI 的报错都没有：
+
+| 症状 | 原因 |
+|---|---|
+| 串口停在 `msh />`，`__main loop__` 一行不出，截图全黑 | `HAL_GetTick()` 冻住了——GTIMR 没做成自由计数器，每个 HAL 超时都变成死循环 |
+| 三行都有、屏幕也真在换帧，但**慢得离谱** | SysTick 的时钟源不对——tick clock 没接到 `refclk`，或频率没用 `clock_update_hz()` 发出去 |
+
+两种都见 `peripherals.md` §3。前两种和这两种都是**静默失败**：固件不崩、刷屏
+线程不卡，只是屏幕不对——所以那三行必须显式对，不能凭"没报错"判过。
 
 ### ④ 代码格式
 
