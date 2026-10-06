@@ -1004,6 +1004,29 @@ const Sf32lb52xUsart sf32lb52x_usarts[] = {
 
 const unsigned sf32lb52x_num_usarts = ARRAY_SIZE(sf32lb52x_usarts);
 
+/*
+ * All four I2C controllers. I2C4 is the odd one: it sits next in the register
+ * window but its interrupt line is numbered below I2C3's, which is why the
+ * table carries the number rather than deriving it.
+ */
+const Sf32lb52xI2c sf32lb52x_i2cs[] = {
+    {
+        .base = SF32LB52X_I2C1_BASE,
+        .irq = SF32LB52X_IRQ_I2C1,
+    }, {
+        .base = SF32LB52X_I2C2_BASE,
+        .irq = SF32LB52X_IRQ_I2C2,
+    }, {
+        .base = SF32LB52X_I2C3_BASE,
+        .irq = SF32LB52X_IRQ_I2C3,
+    }, {
+        .base = SF32LB52X_I2C4_BASE,
+        .irq = SF32LB52X_IRQ_I2C4,
+    },
+};
+
+const unsigned sf32lb52x_num_i2cs = ARRAY_SIZE(sf32lb52x_i2cs);
+
 static void sf32lb52x_periph_register_types(void)
 {
     unsigned i;

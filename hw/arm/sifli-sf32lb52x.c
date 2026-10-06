@@ -37,6 +37,7 @@
 #include "hw/display/sifli-ezip.h"
 #include "hw/display/sifli-lcdc.h"
 #include "hw/dma/sifli-dma.h"
+#include "hw/i2c/sifli-i2c.h"
 #include "hw/misc/armv7m_dwt.h"
 #include "hw/misc/sifli-regbank.h"
 #include "system/system.h"
@@ -418,6 +419,29 @@ static void sifli_sf32lb52x_init(MachineState *machine)
                                             dmas[u->dma_ctrl], "request",
                                             u->dma_rx_req));
         }
+    }
+
+    /*
+     * All four I2C controllers. Like the USARTs they are built whether or not
+     * anything is attached to them: the board's touchdriver opens I2C1 by
+     * name at boot, and firmware that finds no controller there fails
+     * earlier and less legibly than one that finds a controller with an
+     * empty bus.
+     *
+     * The slaves are not built here. A panel's touch controller is a part of
+     * the board, not of the SoC, so it arrives as its own -device and hangs
+     * itself on whichever controller's bus it is told to; see hw/i2c/.
+     */
+    for (i = 0; i < sf32lb52x_num_i2cs; i++) {
+        const Sf32lb52xI2c *c = &sf32lb52x_i2cs[i];
+        g_autofree char *name = g_strdup_printf("i2c%u", i + 1);
+        DeviceState *dev = qdev_new(TYPE_SIFLI_I2C);
+
+        object_property_add_child(OBJECT(machine), name, OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           qdev_get_gpio_in(armv7m, c->irq));
     }
 
     /*

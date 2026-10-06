@@ -106,6 +106,9 @@
 #define SF32LB52X_GPIO1_BASE        0x500a0000ULL
 #define SF32LB52X_GPIO2_BASE        0x40080000ULL
 #define SF32LB52X_I2C1_BASE         0x5009c000ULL
+#define SF32LB52X_I2C2_BASE         0x5009d000ULL
+#define SF32LB52X_I2C3_BASE         0x5009e000ULL
+#define SF32LB52X_I2C4_BASE         0x5009f000ULL
 #define SF32LB52X_LCDC1_BASE        0x50008000ULL
 #define SF32LB52X_SPI1_BASE         0x50095000ULL
 #define SF32LB52X_EZIP1_BASE        0x50006000ULL
@@ -262,6 +265,14 @@ extern const unsigned sf32lb52x_num_dmas;
 extern const Sf32lb52xUsart sf32lb52x_usarts[];
 extern const unsigned sf32lb52x_num_usarts;
 
+typedef struct Sf32lb52xI2c {
+    uint64_t base;
+    unsigned irq;
+} Sf32lb52xI2c;
+
+extern const Sf32lb52xI2c sf32lb52x_i2cs[];
+extern const unsigned sf32lb52x_num_i2cs;
+
 /*
  * External interrupt numbers (IRQn_Type, HCPU side).
  *
@@ -286,6 +297,8 @@ extern const unsigned sf32lb52x_num_usarts;
 #define SF32LB52X_IRQ_USART2        74
 #define SF32LB52X_IRQ_SPI2          75
 #define SF32LB52X_IRQ_I2C2          76
+/* I2C4's line sits below I2C3's; the numbering is not in base-address order. */
+#define SF32LB52X_IRQ_I2C4          78
 #define SF32LB52X_IRQ_GPIO1         84
 #define SF32LB52X_IRQ_MPI1          85
 #define SF32LB52X_IRQ_MPI2          86
