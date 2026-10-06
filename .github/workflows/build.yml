@@ -71,6 +71,15 @@ jobs:
           # berkeley-softfloat-3, berkeley-testfloat-3) while configuring, and
           # diff unconditionally, for the QAPI schema tests. ca-certificates
           # goes with git, for the HTTPS clones.
+          #
+          # SDL2 is the display backend, the only package here that is not a
+          # build tool, and the only one whose DLL build-dist.sh goes looking
+          # for in /mingw64 when it copies the runtime closure.
+          #
+          # Comments cannot be written inside the scalar below: `install` is a
+          # folded block scalar, so a '#' line in it is content rather than a
+          # comment, and reaches pacman as package names -- '#' and the words
+          # after it -- which fails the step. They belong at this level.
           install: >-
             diffutils
             git
@@ -82,8 +91,6 @@ jobs:
             mingw-w64-x86_64-pixman
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-python
-            # The display backend. Its DLL comes out of /mingw64, which is
-            # where build-dist.sh looks when it copies the runtime closure.
             mingw-w64-x86_64-SDL2
 
       - name: Build (Linux, macOS)
