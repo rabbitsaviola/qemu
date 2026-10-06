@@ -419,11 +419,67 @@ vCPU 停住几十毫秒。只有私有格式走这条路。工具路径没给或
 
 ### 6.4 不做的事
 
-- `OUT_SEL = EPIC`（解压结果直接喂 EPIC 流水线，LVGL GPU 走这条）：记一笔后
-  照常完成，目标内存不动。
 - AEZIP / animation（`AEZIP_CTRL`、`FRAME_*`、`SEQ_NUM`）只存寄存器。
+- `OUT_SEL = EPIC` 配非私有格式：HAL 自己就挡掉了（`bf0_hal_ezip.c:103`），
+  模型也记一笔 `LOG_GUEST_ERROR`，用 `END` 收尾——**只有私有格式带容器头，
+  才知道图有多大**，`ezip_coeng_store()` 靠它算每像素几字节（见 §6.5）。
 - `IN_SEL` 选 NAND/QSPI 输入：只做 AHB 输入。
 - 多块解码：52x 上本来就编译掉了。
+
+### 6.5 `OUT_SEL = EPIC`：解码结果不落内存，喂给 EPIC 的 2D 流水线
+
+`OUT_SEL = EPIC` 时 `DST_ADDR` 根本不参与——像素进的是 EPIC 的输入，不是地址
+空间。所以模型不能像 AHB 那样写内存，而要把解出来的帧**留在 EZIP 里**，等
+`epic_run()` 来取。两个设备之间是一条 QOM link（EPIC 的 `ezip` 属性，机器在
+`hw/arm/sifli-sf32lb52x.c` 里接上），**不是**让 EPIC 去读 EZIP 的 MMIO 窗口
+——那不是内存，按内存读什么也解不出来。
+
+谁吃这份数据由 EPIC 侧决定：`COENG_CFG.EZIP_EN`(bit0) 置起，`EZIP_CH_SEL`
+(bits[2:1]) 选中某一层的 channel。**channel 不是图层号**：HAL 的 `LayerIdx2CH()`
+（`bf0_hal_epic.c:1445`）把 VL 编成 0、L0 编成 1。52x 上
+`EPIC_COENG_CFG_EZIP_EN` 存在，所以 HAL 走 `COENG_CFG` 这条路，不是每图层
+`CFG.EZIP_EN` 那条（`bf0_hal_epic.c:1725`）。
+
+**窗口（`START_POINT`/`END_POINT`）在 EPIC 输出模式下确实会写进寄存器**
+（`bf0_hal_ezip.c:288-324`），列在 bit31:16、行在 bit15:0。硬件只解这一块矩形
+——图层被画布裁掉时用不着整幅图。模型这边宿主工具总会吐整幅，所以按窗口裁。
+窗口原点是源图的 `(start_col, start_row)`，而图层的 `TL_POS` 是源图 `(0,0)`
+落画布的位置，于是帧落在 `TL_POS + 窗口原点`。（没有旋转缩放：HAL 对 EZIP
+图层拒绝这两样，`bf0_hal_epic.c:6200`。）
+
+**像素按 ARGB8888 喂给 EPIC。** HAL 把 EZIP 图层的格式一律折成
+`EPIC_L0_CFG_FMT_ARGB8888`（`bf0_hal_epic.c:722`），而工具产出的是
+565/565A/888/888A（见 §6.3 的容器头）。模型按容器头 + 解码长度定出每像素
+几字节：
+
+| 字节/像素 | 容器头 format | 布局 |
+|---|---|---|
+| 2 | 4 | RGB565（无 alpha） |
+| 3 | 4 | RGB888（B,G,R） |
+| 3 | 5 | ARGB8565（565 小端 + alpha） |
+| 4 | 5 | ARGB8888（B,G,R,A） |
+
+565 系按位复制扩成 8888——EPIC 再打包回 565 输出时无损；888/888A 与 EPIC 的
+字节序本来就一致，直接搬。**认不出的 format 记一笔并丢帧**，绝不按别的格式硬解。
+
+**解码出来的 alpha 一定会参与混合**，哪怕 `Ln_CFG` 里 `ALPHA_SEL` 和
+`ALPHA_BLEND` 都没置。HAL 给这种图层传的是 `EPIC_LAYER_OPAQUE`，于是两个位
+都不置（`bf0_hal_epic.c:3098`），按普通图层的读法会被当成全不透明。但 SDK 自带
+的 `example_ezip` 用例（`example/hal_example/src/example/example_ezip.c`）拿
+资产自己算了期望像素，期望值就是按解码 alpha 混到背景上的，所以真机确实在混。
+
+**`OUT_SEL = EPIC` 的作业永远用 `END` 收尾，绝不用错误位。** EPIC 清它的
+"EZIP 在跑"标志**只**从完成回调里做（`EPIC_EzipCpltCallback`，
+`bf0_hal_epic.c:6138`），而 `HAL_EZIP_IRQHandler` 只在 END 时调这个回调
+（`bf0_hal_ezip.c:530`）——报错误位等于让固件永远卡在
+`while (epic->coeng_state)`（`bf0_hal_epic.c:4688`）。所以模型这一侧无论
+解不出来（缺工具、坏流）还是存不下（认不出的格式），都记一笔 `LOG_GUEST_ERROR`
+再用 `END` 收尾：**故障通过日志和"EPIC 找不到帧"两层可见**，而不是靠一个会挂死
+的状态位。AHB 那条路的调用方是轮询 `INT_MASK` 的，照旧报 `BTYPE_ERR`/`ETYPE_ERR`
+（qtest [7d] 钉着）。
+
+**co-engine 开着却没有解码帧**（EPIC 先跑、EZIP 没跑或解失败）：EPIC 记一笔
+`LOG_GUEST_ERROR` 并跳过该图层——绝不拿 `SRC`（那是压缩流地址）当像素读。
 
 ---
 
@@ -481,6 +537,15 @@ HAL 的写法（`bf0_hal_epic.c:1897`、`:4025`）是：
 查。L1/L2 在这颗芯片上不存在（HAL 为 `SF32LB52X` 定义 `EPIC_L2_L1_INVALID`，
 `bf0_hal_epic.c:154`），寄存器存着但够不到。
 
+### 7.6 co-engine：图层的输入来自 EZIP（已做）
+
+`COENG_CFG.EZIP_EN` 置起时，被 `EZIP_CH_SEL` 选中的那一层**不从 `SRC` 取像素**
+——它的输入是 EZIP 解码出来的帧。`VL_SRC` 这时仍然指着压缩流，照普通图层读会
+把位流当像素画。模型从 EZIP 设备的 link（属性 `ezip`，机器接的）取帧，几何和
+alpha 的规矩见 §6.5；没有帧可用时记一笔并跳过该层。
+
+只有 `CH_SEL` 指到的那一层吃 co-engine，其余照旧读 `SRC`。
+
 ---
 
 ## 8. 内存：PSRAM 与两条地址通路
@@ -517,6 +582,10 @@ RGB565），加 PSRAM 就是为了让它们能跑。
 
 模型要把它倒回来，因为模型读 guest 用的是 CPU 视角的地址空间。
 `sifli_sbus_to_cpu_addr()`（`include/hw/misc/sifli-sbus.h`）就干这个。
+
+**还有第三条路：根本不经过地址。** 图层被 EZIP co-engine 接管时（§6.5/§7.6），
+像素来自 EZIP 设备里那份解码帧，`SRC` 只是压缩流地址、不参与取像素。这条路上
+既没有 SBUS 别名也没有 `AHB_MEM` 的事，两个设备之间是一条 QOM link。
 
 ### 8.3 翻译窗口为什么只有 4 MB
 

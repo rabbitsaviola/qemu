@@ -358,6 +358,90 @@ else
 fi
 
 echo
+echo "[9b] EZIP → EPIC：解码结果喂进 2D 流水线"
+# 与 [9] 同一条私有格式路径，但 PARA.OUT_SEL 选 EPIC（bit0 = 0）：像素不落
+# 内存，而是留在 EZIP 里等 EPIC 的 co-engine 来取。EPIC 侧由 COENG_CFG 指定
+# 哪一层吃它：EZIP_EN(bit0) + EZIP_CH_SEL(bits[2:1])，而 CH_SEL = 0 是 VL
+# （HAL 的 LayerIdx2CH，不是图层号）。VL_SRC 这时还是压缩流地址，绝不能被
+# 当成像素读 —— 这正是模型要和内存取像素那条路分开的地方。
+#
+# 窗口取解码图第 10 行 x=28..31（START/END_POINT 里列在 bit31:16、行在
+# bit15:0，即 START=0x001c000a、END=0x001f000a）。前两个像素 alpha=255，
+# 输出应等于资产里的 565 原值 0xffc9/0xb4e6；后两个 alpha=248/243，输出是
+# 按解码 alpha 混到黑底上的 0x0820/0x5aa2 —— 注意 x=31 那个：原值 0x62c3
+# 混完是 0x5aa2，不混就是原色。HAL 给 EZIP 图层传的是 EPIC_LAYER_OPAQUE，
+# CFG 里两个 alpha 位都不置，按普通图层的读法这会画成 0x62c3，所以这一格
+# 钉的就是"co-engine 的像素带自己的 alpha"。
+#
+# 图层的 (0,0) 是源图原点，帧落在 TL_POS + 窗口原点，所以窗口在 (28,10)
+# 就要求画布覆盖到那里。画布 32x11、VL 铺满，采样点 (28,10) 的字偏移是
+# (10*32+28)*2 = 696。
+if [ ! -x "$TOOL" ] || [ ! -r "$ASSET_SRC" ]; then
+    echo "  [SKIP] 缺 $TOOL 或 SDK 资产，设 SIFLI_SDK 指向 SDK 根目录可打开"
+else
+    src_hex=$(strip_array "$ASSET_SRC")
+    src_len=$(( ${#src_hex} / 2 ))
+    out9b=$(printf '%s\n' \
+            "write 0x20004000 $src_len 0x$src_hex" \
+            'writel 0x50006004 0x20004000' \
+            'writel 0x5000600c 0x00000000' \
+            'writel 0x50006014 0x001c000a' \
+            'writel 0x50006018 0x001f000a' \
+            'writel 0x50006000 0x00000001' \
+            'writel 0x500070f8 0x00000000' \
+            'writel 0x500070fc 0x20005000' \
+            'writel 0x50007100 0x00000000' \
+            'writel 0x50007010 0x00000000' \
+            'writel 0x50007014 0x000a001f' \
+            'writel 0x50007018 0x01000000' \
+            'writel 0x5000701c 0x40000002' \
+            'writel 0x50007020 0x00000000' \
+            'writel 0x50007024 0x000a001f' \
+            'writel 0x500070d0 0x00000001' \
+            'writel 0x50007000 0x00000001' \
+            'readl 0x200052b8' \
+            'readl 0x200052bc' \
+            quit \
+        | timeout 90 "$QEMU" -M "sf32lb52x,ezip-tool=$TOOL" -display none \
+              -serial none -qtest stdio 2>/dev/null | tr -d '\r')
+    # 两个读的返回。这一轮没有别的载荷读，所以直接取最后两行。
+    got0=$(echo "$out9b" | grep '^OK 0x' | tail -2 | sed -n '1p' | sed 's/^OK //')
+    got1=$(echo "$out9b" | grep '^OK 0x' | tail -2 | sed -n '2p' | sed 's/^OK //')
+    for pair in "0xb4e6ffc9:$got0:不透明像素按资产原值落位" \
+                "0x5aa20820:$got1:半透明像素按解码 alpha 混到黑底"; do
+        want=${pair%%:*}; rest=${pair#*:}; got=${rest%%:*}; what=${rest#*:}
+        if [ -n "$got" ] && [ $((got)) -eq $((want)) ]; then
+            printf '  [PASS] %-40s = %s\n' "$what" "$got"
+        else
+            printf '  [FAIL] %-40s 期望 %s，实际 %s\n' \
+                "$what" "$want" "${got:-<无>}"
+            FAILED=$((FAILED + 1))
+        fi
+    done
+fi
+
+echo
+echo "[9c] EZIP：EPIC 输出下解不出来也必须报 END，不能报错误位"
+# EPIC 的 co-engine 握手只认完成回调，而 HAL_EZIP_IRQHandler 只在 END 时调它
+# （bf0_hal_ezip.c:530），错误位会让固件永远卡在 while (epic->coeng_state)
+# （bf0_hal_epic.c:4688）。所以 EPIC 输出模式下模型必须记一笔、用 END 收尾；
+# AHB 那条路照旧报错误位（[7d] 仍是 BTYPE_ERR）。
+#
+# 把 SRC_ADDR 指到一个读不了的地方，制造一次解码失败。
+out=$(run \
+    'writel 0x50006004 0xffffffff' \
+    'writel 0x5000600c 0x00000000' \
+    'writel 0x50006014 0x00000000' \
+    'writel 0x50006018 0x00000001' \
+    'writel 0x50006000 0x00000001' \
+    'readl 0x50006024' \
+    'readl 0x50006028')
+vals=$(echo "$out" | grep '^OK 0x')
+i=0
+check 0x1 "INT_STA 报 END 而不是 BTYPE_ERR"
+check 0x1 "INT_MASK 报 END 而不是 BTYPE_ERR"
+
+echo
 echo "[10] LCDC：命令路径（控制器问面板「你是谁」）"
 # 这一串完全照抄 co5300.c 的 LCD_ReadID()：
 #   LCD_ReadMode(true)        SPI_IF_CONF 分频
