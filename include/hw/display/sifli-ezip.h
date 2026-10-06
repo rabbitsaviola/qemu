@@ -83,6 +83,15 @@ enum {
 #define EZIP_PARA_SPI_SEL           BIT(5)
 
 /*
+ * The colour formats the vendor tool writes into its four-byte container
+ * header. The tool follows LVGL's numbering (docs/.../ezip_tool_usage.md),
+ * and the values matter here only to tell RGB888 apart from ARGB8565: both
+ * are three bytes per pixel.
+ */
+#define EZIP_PIXEL_FMT_TRUE_COLOR       4
+#define EZIP_PIXEL_FMT_TRUE_COLOR_ALPHA 5
+
+/*
  * INT_EN, INT_STA and INT_MASK share a layout. The three error bits are the
  * ones HAL_EZIP_Decode and the interrupt path react to; END is the one that
  * means the frame is there.
@@ -125,6 +134,35 @@ struct SifliEzipState {
      * deflate stream ends itself, so this is a backstop rather than a size.
      */
     uint32_t window_bytes;
+
+    /*
+     * The last frame decoded for the EPIC co-engine, as ARGB8888, or NULL
+     * when nothing has been decoded. When EZIP_PARA.OUT_SEL picks EPIC the
+     * decoded pixels feed EPIC's 2D pipeline instead of memory, so they have
+     * to outlive the MMIO write that produced them; EPIC picks them up from
+     * here through sifli_ezip_coeng_frame().
+     */
+    uint8_t *coeng_pixels;
+    unsigned coeng_width;
+    unsigned coeng_height;
+    unsigned coeng_start_col;   /* source column of coeng_pixels[0] */
+    unsigned coeng_start_row;
 };
+
+/* One decoded frame, handed from the EZIP decoder to EPIC's co-engine. */
+typedef struct SifliEzipFrame {
+    const uint8_t *pixels;      /* ARGB8888, width * height pixels */
+    unsigned width;
+    unsigned height;
+    unsigned start_col;         /* source-image column of pixels[0] */
+    unsigned start_row;
+} SifliEzipFrame;
+
+/*
+ * The frame the co-engine last decoded. False when there is none, which is
+ * what EPIC reports when it is asked to draw a co-engine layer before EZIP
+ * has run.
+ */
+bool sifli_ezip_coeng_frame(SifliEzipState *s, SifliEzipFrame *frame);
 
 #endif /* HW_DISPLAY_SIFLI_EZIP_H */

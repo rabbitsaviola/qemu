@@ -10,6 +10,7 @@
 #ifndef HW_DISPLAY_SIFLI_EPIC_H
 #define HW_DISPLAY_SIFLI_EPIC_H
 
+#include "hw/display/sifli-ezip.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
 
@@ -174,6 +175,17 @@ enum {
 #define EPIC_AHB_CTRL_O_FORMAT_Pos  1
 #define EPIC_AHB_CTRL_O_FORMAT_Msk  (3u << 1)
 
+/*
+ * COENG_CFG: which layer's input comes from a co-engine rather than from its
+ * SRC register. EZIP_CH_SEL is the layer's channel, which the HAL's
+ * LayerIdx2CH() numbers VL=0, L0=1 (bf0_hal_epic.c:1445) -- not the layer
+ * index. EPIC_COENG_CFG_EZIP_EN exists on 52x, so the HAL takes this path
+ * rather than the per-layer CFG.EZIP_EN one.
+ */
+#define EPIC_COENG_CFG_EZIP_EN          BIT(0)
+#define EPIC_COENG_CFG_EZIP_CH_SEL_Pos  1
+#define EPIC_COENG_CFG_EZIP_CH_SEL_Msk  (3u << 1)
+
 enum {
     EPIC_OUT_RGB565 = 0,
     EPIC_OUT_RGB888 = 1,
@@ -194,6 +206,14 @@ struct SifliEpicState {
     qemu_irq irq;
 
     uint32_t reg[SIFLI_EPIC_NUM_REGS];
+
+    /*
+     * The EZIP decoder a co-engine layer reads its pixels from. Wired by the
+     * machine; NULL leaves the co-engine path reporting rather than drawing.
+     * The coupling is a QOM link rather than EPIC walking the EZIP MMIO
+     * window, which is not memory and would decode nothing.
+     */
+    SifliEzipState *ezip;
 };
 
 #endif /* HW_DISPLAY_SIFLI_EPIC_H */

@@ -42,6 +42,7 @@
 #include "hw/display/sifli-epic.h"
 #include "hw/irq.h"
 #include "hw/misc/sifli-sbus.h"
+#include "hw/qdev-properties.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -58,6 +59,7 @@
 /* What a layer's registers say, pulled out of the flat register file. */
 typedef struct EpicLayer {
     const char *name;       /* for the log messages */
+    unsigned channel;       /* what COENG_CFG.CH_SEL calls this layer */
     unsigned cfg_off;       /* SIFLI_EPIC_<name>_CFG */
     unsigned tl_off;
     unsigned br_off;
@@ -71,11 +73,15 @@ typedef struct EpicLayer {
  * backgrounds and copies into; VL is the video layer that goes on top of it,
  * which is also the one HAL_EPIC_ConfigFilling sets up when it fills with an
  * alpha rather than an opaque colour.
+ *
+ * The channel numbers are HAL LayerIdx2CH's, not the layer index
+ * (bf0_hal_epic.c:1445): the co-engine selects a channel, and VL happens to
+ * be channel 0 and L0 channel 1.
  */
 static const EpicLayer epic_layers[] = {
-    { "L0", SIFLI_EPIC_L0_CFG, SIFLI_EPIC_L0_TL_POS, SIFLI_EPIC_L0_BR_POS,
+    { "L0", 1, SIFLI_EPIC_L0_CFG, SIFLI_EPIC_L0_TL_POS, SIFLI_EPIC_L0_BR_POS,
       SIFLI_EPIC_L0_SRC, SIFLI_EPIC_L0_FILL },
-    { "VL", SIFLI_EPIC_VL_CFG, SIFLI_EPIC_VL_TL_POS, SIFLI_EPIC_VL_BR_POS,
+    { "VL", 0, SIFLI_EPIC_VL_CFG, SIFLI_EPIC_VL_TL_POS, SIFLI_EPIC_VL_BR_POS,
       SIFLI_EPIC_VL_SRC, SIFLI_EPIC_VL_FILL },
 };
 
@@ -249,6 +255,99 @@ static void epic_finish(SifliEpicState *s)
 }
 
 /*
+ * Composite one pixel onto the canvas and re-encode it.
+ *
+ * Which of the two alpha bits is set is decided by the source format, not by
+ * the firmware's intent: a source that carries an alpha channel blends per
+ * pixel (ALPHA_BLEND), one that does not blends by the constant in the
+ * register (ALPHA_SEL), and the HAL sets neither when it means the layer to
+ * be opaque. The register's ALPHA field is written in both cases, so reading
+ * it when ALPHA_BLEND is what was meant would ignore the pixel.
+ */
+static void epic_composite(uint8_t *dst, unsigned o_format, unsigned format,
+                           EpicPixel px, unsigned a)
+{
+    if (a != 255) {
+        EpicPixel under = epic_decode_pixel(dst, o_format);
+
+        px.r = (px.r * a + under.r * (255 - a) + 127) / 255;
+        px.g = (px.g * a + under.g * (255 - a) + 127) / 255;
+        px.b = (px.b * a + under.b * (255 - a) + 127) / 255;
+        px.a = a + (under.a * (255 - a) + 127) / 255;
+    } else if (format == EPIC_FMT_RGB565 || format == EPIC_FMT_RGB888) {
+        /* No alpha channel in the source; the output has one. */
+        px.a = 255;
+    }
+
+    epic_encode_pixel(dst, o_format, px);
+}
+
+/*
+ * Draw a layer whose pixels come from the EZIP co-engine instead of memory.
+ *
+ * The decoded frame is the window EZIP was asked for, in source-image
+ * coordinates: frame pixel (0, 0) is source pixel (start_col, start_row), and
+ * the layer's TL_POS is where source pixel (0, 0) sits on the canvas -- the
+ * HAL refuses rotation and scaling for an EZIP layer (bf0_hal_epic.c:6200),
+ * so those do not enter into it. The frame therefore lands at TL_POS plus the
+ * window's own origin.
+ *
+ * The decoded pixels are ARGB8888 and their alpha is always applied, which is
+ * not what the ALPHA_SEL/ALPHA_BLEND reading of the layer CFG would give: the
+ * HAL passes EPIC_LAYER_OPAQUE for the blend and so leaves both bits clear
+ * (bf0_hal_epic.c:3098). But the SDK's own example_ezip check expects the
+ * decoded alpha to be blended in -- it compares against the image composited
+ * onto the background by that alpha -- so the co-engine's pixels must carry
+ * it into the blend whatever the CFG says.
+ */
+static void epic_draw_coeng_ezip(SifliEpicState *s, const EpicLayer *l,
+                                 uint8_t *canvas, unsigned cx0, unsigned cy0,
+                                 unsigned cw, unsigned ch, unsigned dst_bpp,
+                                 unsigned o_format, unsigned lx0, unsigned ly0,
+                                 unsigned lx1, unsigned ly1)
+{
+    SifliEzipFrame frame;
+    unsigned fx0, fy0, x0, y0, x1, y1, x, y;
+
+    if (s->ezip == NULL || !sifli_ezip_coeng_frame(s->ezip, &frame)) {
+        /*
+         * COENG_CFG says this layer's input is EZIP but nothing has been
+         * decoded. Reading SRC instead would take the compressed stream for
+         * pixels, and drawing nothing quietly would hide the mistake.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sifli-epic: %s is fed by the EZIP co-engine but no "
+                      "decoded frame is available; the layer is skipped\n",
+                      l->name);
+        return;
+    }
+
+    /* Where the window sits on the canvas: layer TL plus the window origin. */
+    fx0 = lx0 + frame.start_col;
+    fy0 = ly0 + frame.start_row;
+    x0 = MAX(fx0, MAX(lx0, cx0));
+    y0 = MAX(fy0, MAX(ly0, cy0));
+    x1 = MIN(fx0 + frame.width - 1, MIN(lx1, cx0 + cw - 1));
+    y1 = MIN(fy0 + frame.height - 1, MIN(ly1, cy0 + ch - 1));
+    if (x1 < x0 || y1 < y0) {
+        return;
+    }
+
+    for (y = y0; y <= y1; y++) {
+        const uint8_t *row = frame.pixels +
+                             (size_t)(y - fy0) * frame.width * 4;
+
+        for (x = x0; x <= x1; x++) {
+            const uint8_t *raw = row + (size_t)(x - fx0) * 4;
+            uint8_t *dst = canvas + ((y - cy0) * cw + (x - cx0)) * dst_bpp;
+            EpicPixel px = epic_decode_pixel(raw, EPIC_FMT_ARGB8888);
+
+            epic_composite(dst, o_format, EPIC_FMT_ARGB8888, px, px.a);
+        }
+    }
+}
+
+/*
  * Composite one layer onto the canvas.
  *
  * The layer's own rectangle is in canvas coordinates; the canvas rectangle is
@@ -271,6 +370,7 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
     bool alpha_sel = (cfg & EPIC_L_CFG_ALPHA_SEL) != 0;
     bool blend = (cfg & EPIC_L_CFG_ALPHA_BLEND) != 0;
     uint32_t src = sifli_sbus_to_cpu_addr(s->reg[l->src_off / 4]);
+    uint32_t coeng = s->reg[SIFLI_EPIC_COENG_CFG / 4];
     unsigned lx0 = tl & EPIC_CANVAS_X_Msk;
     unsigned ly0 = (tl & EPIC_CANVAS_Y_Msk) >> EPIC_CANVAS_Y_Pos;
     unsigned lx1 = br & EPIC_CANVAS_X_Msk;
@@ -283,6 +383,19 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
     if (lx1 < lx0 || ly1 < ly0) {
         return;
     }
+
+    /*
+     * One layer at a time takes its input from the co-engine, whichever one
+     * COENG_CFG.EZIP_CH_SEL names; the rest keep reading SRC.
+     */
+    if ((coeng & EPIC_COENG_CFG_EZIP_EN) &&
+        ((coeng & EPIC_COENG_CFG_EZIP_CH_SEL_Msk) >>
+         EPIC_COENG_CFG_EZIP_CH_SEL_Pos) == l->channel) {
+        epic_draw_coeng_ezip(s, l, canvas, cx0, cy0, cw, ch, dst_bpp,
+                             o_format, lx0, ly0, lx1, ly1);
+        return;
+    }
+
     if (src_stride == 0) {
         /*
          * A stride of zero is not a stride the hardware can walk, and the
@@ -320,15 +433,6 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
             }
             px = epic_decode_pixel(raw, format);
 
-            /*
-             * Which of the two alpha bits is set is decided by the source
-             * format, not by the firmware's intent: a source that carries an
-             * alpha channel blends per pixel (ALPHA_BLEND), one that does not
-             * blends by the constant in the register (ALPHA_SEL), and the
-             * HAL sets neither when it means the layer to be opaque. The
-             * register's ALPHA field is written in both cases, so reading it
-             * when ALPHA_BLEND is what was meant would ignore the pixel.
-             */
             if (alpha_sel) {
                 a = alpha;
             } else if (blend) {
@@ -337,19 +441,7 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
                 a = 255;
             }
 
-            if (a != 255) {
-                EpicPixel under = epic_decode_pixel(dst, o_format);
-
-                px.r = (px.r * a + under.r * (255 - a) + 127) / 255;
-                px.g = (px.g * a + under.g * (255 - a) + 127) / 255;
-                px.b = (px.b * a + under.b * (255 - a) + 127) / 255;
-                px.a = a + (under.a * (255 - a) + 127) / 255;
-            } else if (format == EPIC_FMT_RGB565 || format == EPIC_FMT_RGB888) {
-                /* No alpha channel in the source; the output has one. */
-                px.a = 255;
-            }
-
-            epic_encode_pixel(dst, o_format, px);
+            epic_composite(dst, o_format, format, px, a);
         }
     }
 }
@@ -575,11 +667,23 @@ static void sifli_epic_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 }
 
+static const Property sifli_epic_properties[] = {
+    /*
+     * The EZIP decoder this engine's co-engine reads pixels from. It is a
+     * link rather than a plain pointer so the machine wires it the way it
+     * wires every other device relationship, and so a board without one
+     * still has a working EPIC.
+     */
+    DEFINE_PROP_LINK("ezip", SifliEpicState, ezip, TYPE_SIFLI_EZIP,
+                     SifliEzipState *),
+};
+
 static void sifli_epic_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, sifli_epic_reset);
+    device_class_set_props(dc, sifli_epic_properties);
 }
 
 static const TypeInfo sifli_epic_info = {

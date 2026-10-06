@@ -316,7 +316,8 @@ static bool ezip_decode_lz4(const uint8_t *in, size_t in_len, EzipBuffer *out)
  */
 static bool ezip_decode_proprietary(SifliEzipState *s, const uint8_t *in,
                                     size_t in_len, EzipBuffer *out,
-                                    unsigned *db_width, unsigned *db_height)
+                                    unsigned *db_width, unsigned *db_height,
+                                    unsigned *db_format)
 {
     g_autofree char *tmpdir = NULL;
     g_autofree char *in_dir = NULL;
@@ -429,11 +430,15 @@ static bool ezip_decode_proprietary(SifliEzipState *s, const uint8_t *in,
      *     [31:21] height  [20:10] width  [9:5] reserved  [4:0] format
      *
      * which is also what the hardware leaves in DB_DATA1, so it is worth
-     * reading on the way past rather than discarding.
+     * reading on the way past rather than discarding. The format is the
+     * vendor tool's colour format, which is LVGL's: 4 is TRUE_COLOR and 5 is
+     * TRUE_COLOR_ALPHA, and for the 16-bit tool that built these assets that
+     * is two and three bytes per pixel.
      */
     header = ldl_le_p((const uint8_t *)contents);
     *db_width = (header >> 10) & 0x7ff;
     *db_height = (header >> 21) & 0x7ff;
+    *db_format = header & 0x1f;
 
     ok = ezip_buffer_append(out, (const uint8_t *)contents +
                             EZIP_TOOL_HEADER_SIZE,
@@ -456,6 +461,176 @@ out:
         g_rmdir(tmpdir);
     }
     return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* The EPIC co-engine.                                                 */
+/* ------------------------------------------------------------------ */
+
+static void ezip_coeng_clear(SifliEzipState *s)
+{
+    g_free(s->coeng_pixels);
+    s->coeng_pixels = NULL;
+    s->coeng_width = 0;
+    s->coeng_height = 0;
+    s->coeng_start_col = 0;
+    s->coeng_start_row = 0;
+}
+
+bool sifli_ezip_coeng_frame(SifliEzipState *s, SifliEzipFrame *frame)
+{
+    if (s->coeng_pixels == NULL) {
+        return false;
+    }
+
+    frame->pixels = s->coeng_pixels;
+    frame->width = s->coeng_width;
+    frame->height = s->coeng_height;
+    frame->start_col = s->coeng_start_col;
+    frame->start_row = s->coeng_start_row;
+    return true;
+}
+
+/* 5-bit / 6-bit channel to the 8-bit one bit replication gives. */
+static uint8_t ezip_expand5(unsigned v)
+{
+    return (v << 3) | (v >> 2);
+}
+
+static uint8_t ezip_expand6(unsigned v)
+{
+    return (v << 2) | (v >> 4);
+}
+
+/*
+ * Hand a decoded frame to EPIC.
+ *
+ * The window registers say which part of the source image the layer is
+ * showing: START_POINT and END_POINT carry (row, column) pairs, and hardware
+ * decodes only that rectangle, because a layer clipped by the canvas only
+ * needs its visible part. The host decoder has already produced the whole
+ * image, so the model crops to the window, converts to the ARGB8888 the
+ * EPIC co-engine speaks, and parks it in the device state for epic_run().
+ *
+ * The format is deduced from the image size the container header gave and
+ * the number of bytes the decoder produced; only the three-byte case needs
+ * the header's colour format, to tell RGB888 from ARGB8565.
+ *
+ * Everything that can go wrong here is a limit of the model rather than of
+ * the hardware -- the real decoder knows the format from the bitstream. So a
+ * frame the model cannot interpret is logged and dropped, and the job still
+ * reports END: firmware is never left waiting on a job that will not finish,
+ * and EPIC then reports the missing frame in turn.
+ */
+static void ezip_coeng_store(SifliEzipState *s, const EzipBuffer *out,
+                             unsigned img_w, unsigned img_h, unsigned format)
+{
+    unsigned col_start = (s->reg[SIFLI_EZIP_START_POINT / 4] >> 16) & 0xffff;
+    unsigned col_end = (s->reg[SIFLI_EZIP_END_POINT / 4] >> 16) & 0xffff;
+    unsigned row_start = s->reg[SIFLI_EZIP_START_POINT / 4] & 0xffff;
+    unsigned row_end = s->reg[SIFLI_EZIP_END_POINT / 4] & 0xffff;
+    unsigned bpp, width, height, x, y;
+
+    if (img_w == 0 || img_h == 0 || out->len == 0 ||
+        out->len % ((size_t)img_w * img_h) != 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sifli-ezip: cannot tell the image size of %zu decoded "
+                      "bytes for the EPIC co-engine\n", out->len);
+        return;
+    }
+    bpp = out->len / ((size_t)img_w * img_h);
+    /*
+     * Three bytes per pixel is RGB888 or ARGB8565, and only the container
+     * header's colour format separates them. Refuse an unknown one rather
+     * than decode it as something it is not.
+     */
+    if (bpp == 3 && format != EZIP_PIXEL_FMT_TRUE_COLOR &&
+        format != EZIP_PIXEL_FMT_TRUE_COLOR_ALPHA) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sifli-ezip: colour format %u with three bytes per "
+                      "pixel is not one the EPIC co-engine can be fed\n",
+                      format);
+        return;
+    }
+    if (bpp != 2 && bpp != 3 && bpp != 4) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sifli-ezip: %u bytes per pixel is not a format the "
+                      "EPIC co-engine can be fed\n", bpp);
+        return;
+    }
+
+    if (col_end < col_start || row_end < row_start ||
+        col_end >= img_w || row_end >= img_h) {
+        /*
+         * The HAL always programs a window that fits (bf0_hal_epic.c:3875
+         * takes it from the layer/canvas intersection), so a bad one is a
+         * register set no HAL call produces. Drawing the whole image is not
+         * what hardware would do, but it is visible in the log.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sifli-ezip: window (%u,%u)-(%u,%u) does not fit the "
+                      "%ux%u image; using the whole image\n",
+                      col_start, row_start, col_end, row_end, img_w, img_h);
+        col_start = 0;
+        row_start = 0;
+        col_end = img_w - 1;
+        row_end = img_h - 1;
+    }
+
+    width = col_end - col_start + 1;
+    height = row_end - row_start + 1;
+    s->coeng_pixels = g_malloc((size_t)width * height * 4);
+
+    {
+        const uint8_t *row = out->data +
+                             (size_t)row_start * img_w * bpp +
+                             (size_t)col_start * bpp;
+
+        for (y = 0; y < height; y++, row += (size_t)img_w * bpp) {
+            for (x = 0; x < width; x++) {
+                const uint8_t *raw = row + (size_t)x * bpp;
+                uint8_t *px = s->coeng_pixels +
+                              ((size_t)y * width + x) * 4;
+
+                if (bpp == 4) {
+                    /* ARGB8888: B, G, R, A, the co-engine's own order. */
+                    memcpy(px, raw, 4);
+                    continue;
+                }
+
+                if (bpp == 3 && format == EZIP_PIXEL_FMT_TRUE_COLOR) {
+                    /* RGB888: B, G, R with no alpha. */
+                    px[0] = raw[0];
+                    px[1] = raw[1];
+                    px[2] = raw[2];
+                    px[3] = 0xff;
+                    continue;
+                }
+
+                /*
+                 * RGB565 and ARGB8565 expand to 8888 by bit replication,
+                 * which is lossless when EPIC packs it back into a 565
+                 * destination.
+                 */
+                {
+                    uint16_t v = lduw_le_p(raw);
+                    unsigned r = (v >> 11) & 0x1f;
+                    unsigned g = (v >> 5) & 0x3f;
+                    unsigned b = v & 0x1f;
+
+                    px[0] = ezip_expand5(b);
+                    px[1] = ezip_expand6(g);
+                    px[2] = ezip_expand5(r);
+                    px[3] = (bpp == 3) ? raw[2] : 0xff;
+                }
+            }
+        }
+    }
+
+    s->coeng_width = width;
+    s->coeng_height = height;
+    s->coeng_start_col = col_start;
+    s->coeng_start_row = row_start;
 }
 
 /* ------------------------------------------------------------------ */
@@ -482,6 +657,25 @@ static void ezip_complete(SifliEzipState *s, uint32_t status)
     ezip_update_irq(s);
 }
 
+/*
+ * Finish a job, choosing the status the caller can actually consume.
+ *
+ * An EPIC-output job always ends with END, never with an error bit. EPIC
+ * only clears its "EZIP running" flag from the completion callback
+ * (EPIC_EzipCpltCallback, bf0_hal_epic.c:6138), and HAL_EZIP_IRQHandler runs
+ * that callback only for END (bf0_hal_ezip.c:530) -- an error bit therefore
+ * leaves the HAL spinning in "while (epic->coeng_state)" (bf0_hal_epic.c:
+ * 4688, :4853, :5019) for good. So a decode the model cannot do is reported
+ * through the log, and through the frame EPIC then finds missing, rather
+ * than through a status that hangs the firmware. The AHB path is polled by
+ * its caller, so it keeps the error bits.
+ */
+static void ezip_complete_run(SifliEzipState *s, bool out_epic,
+                              uint32_t status)
+{
+    ezip_complete(s, out_epic ? EZIP_INT_END : status);
+}
+
 /* ------------------------------------------------------------------ */
 /* The job itself.                                                     */
 /* ------------------------------------------------------------------ */
@@ -492,26 +686,22 @@ static void ezip_run(SifliEzipState *s)
     uint32_t src = sifli_sbus_to_cpu_addr(s->reg[SIFLI_EZIP_SRC_ADDR / 4]);
     uint32_t dst = s->reg[SIFLI_EZIP_DST_ADDR / 4];
     unsigned mode = (para & EZIP_PARA_MOD_SEL) >> 1;
+    /* Output to EPIC feeds the 2D pipeline's input instead of memory. */
+    bool out_epic = !(para & EZIP_PARA_OUT_SEL);
     EzipBuffer out = { 0 };
     g_autofree uint8_t *in = NULL;
     size_t in_len;
     /* How much of the window was stream; the window itself when unknowable. */
     size_t used;
     bool ok;
-    unsigned db_width = 0, db_height = 0;
+    unsigned db_width = 0, db_height = 0, db_format = 0;
 
     /*
-     * Output to EPIC feeds the 2D pipeline's input instead of memory. The
-     * LVGL GPU path uses it; the example firmware and DFU do not, and a
-     * model that finished without decoding is far more useful than one that
-     * hangs, so the job completes and the missing part is logged.
+     * Clearing here means a decode that fails leaves no frame behind for
+     * EPIC to draw by mistake.
      */
-    if (!(para & EZIP_PARA_OUT_SEL)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "sifli-ezip: output to EPIC is not implemented; the "
-                      "destination will be left untouched\n");
-        ezip_complete(s, EZIP_INT_END);
-        return;
+    if (out_epic) {
+        ezip_coeng_clear(s);
     }
 
     in_len = ezip_source_window(s, src);
@@ -519,7 +709,7 @@ static void ezip_run(SifliEzipState *s)
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sifli-ezip: source address 0x%08x is not readable\n",
                       s->reg[SIFLI_EZIP_SRC_ADDR / 4]);
-        ezip_complete(s, EZIP_INT_BTYPE_ERR);
+        ezip_complete_run(s, out_epic, EZIP_INT_BTYPE_ERR);
         return;
     }
 
@@ -530,14 +720,14 @@ static void ezip_run(SifliEzipState *s)
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sifli-ezip: cannot read %zu bytes from 0x%08x\n",
                       in_len, src);
-        ezip_complete(s, EZIP_INT_BTYPE_ERR);
+        ezip_complete_run(s, out_epic, EZIP_INT_BTYPE_ERR);
         return;
     }
 
     switch (mode) {
     case EZIP_PARA_MOD_EZIP:
         ok = ezip_decode_proprietary(s, in, in_len, &out,
-                                     &db_width, &db_height);
+                                     &db_width, &db_height, &db_format);
         break;
     case EZIP_PARA_MOD_GZIP:
         ok = ezip_decode_gzip(in, in_len, &out, &used);
@@ -575,16 +765,17 @@ static void ezip_run(SifliEzipState *s)
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sifli-ezip: mode %u failed to decode %zu bytes from "
                       "0x%08x\n", mode, in_len, src);
-        ezip_complete(s, EZIP_INT_BTYPE_ERR);
+        ezip_complete_run(s, out_epic, EZIP_INT_BTYPE_ERR);
         return;
     }
 
-    /*
-     * An empty stream is a legitimate image of nothing; there is just
-     * nothing to put in the destination.
-     */
-    if (out.len > 0) {
+    if (!(para & EZIP_PARA_OUT_SEL)) {
+        ezip_coeng_store(s, &out, db_width, db_height, db_format);
+    } else if (out.len > 0) {
         /*
+         * An empty stream is a legitimate image of nothing; there is just
+         * nothing to put in the destination.
+         *
          * A finite check before the write: a decode that produced more than
          * the address space holds would otherwise walk off the end of the
          * guest. As above, avail goes in as what we want and comes back
@@ -739,6 +930,7 @@ static void sifli_ezip_reset(DeviceState *dev)
     SifliEzipState *s = SIFLI_EZIP(dev);
 
     memset(s->reg, 0, sizeof(s->reg));
+    ezip_coeng_clear(s);
     ezip_update_irq(s);
 }
 

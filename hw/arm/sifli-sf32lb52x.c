@@ -443,12 +443,22 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         }
 
         object_property_add_child(OBJECT(machine), "epic", OBJECT(epic));
+        object_property_add_child(OBJECT(machine), "ezip", OBJECT(ezip));
+
+        /*
+         * EPIC's co-engine needs the EZIP decoder itself, not its registers:
+         * a layer can take its pixels from EZIP instead of memory, and the
+         * decoded frame never lands in the address space. The link is set
+         * once both are in the QOM tree, because it is stored as a path.
+         */
+        object_property_set_link(OBJECT(epic), "ezip", OBJECT(ezip),
+                                 &error_abort);
+
         sysbus_realize_and_unref(SYS_BUS_DEVICE(epic), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(epic), 0, SF32LB52X_EPIC_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(epic), 0,
                            qdev_get_gpio_in(armv7m, SF32LB52X_IRQ_EPIC));
 
-        object_property_add_child(OBJECT(machine), "ezip", OBJECT(ezip));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(ezip), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(ezip), 0, SF32LB52X_EZIP1_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(ezip), 0,
