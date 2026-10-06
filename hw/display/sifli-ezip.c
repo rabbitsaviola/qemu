@@ -57,6 +57,10 @@
 #include "qemu/module.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+/* g_mkdir, g_remove and g_rmdir live here, not in glib.h. Include it
+ * explicitly: GCC 11 only warns about the implicit declarations, but GCC 14
+ * and later make them an error, and MSYS2 ships one of those. */
+#include <glib/gstdio.h>
 #include <zlib.h>
 
 /*
