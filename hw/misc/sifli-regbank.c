@@ -117,6 +117,11 @@ void sifli_regbank_set_clock(SifliRegBankState *s, Clock *clk)
     s->clk = clk;
 }
 
+void sifli_regbank_set_tick_clock(SifliRegBankState *s, Clock *clk)
+{
+    s->tick_clk = clk;
+}
+
 void sifli_regbank_set_peer(SifliRegBankState *s, SifliRegBankState *peer)
 {
     s->peer = peer;

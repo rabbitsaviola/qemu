@@ -55,6 +55,13 @@ struct Sifli52xMachineState {
 
     Clock *sysclk;
 
+    /*
+     * The 800 kHz tick clock SysTick falls back to. Separate from sysclk
+     * because the firmware usually selects it instead, and the two are not
+     * related by any divider this model tracks.
+     */
+    Clock *systickclk;
+
     /* Boot flash window; depends on the part number. */
     uint32_t flash_base;
     uint32_t flash_size;
@@ -241,6 +248,32 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     qdev_prop_set_uint32(armv7m, "init-nsvtor", s->flash_base);
 
     qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
+
+    /*
+     * SysTick's other clock source, and the one this firmware actually uses.
+     *
+     * rt_hw_systick_init() (drv_common.c:126) points the HP tick at HRC48,
+     * divides it by 60, and then programs the reload as
+     * 800000 / RT_TICK_PER_SECOND, so it takes SysTick to be counting 800 kHz
+     * and gets its 1 ms tick from that. The firmware then clears CLKSOURCE,
+     * selecting this clock rather than HCLK.
+     *
+     * The rate is not set here: the RCC model derives it from CSR.SEL_TICK
+     * and CFGR.TICKDIV on every write to those registers, exactly as the
+     * firmware's SetTickDiv() and ClockSelect() expect, and this is just the
+     * wire it publishes it on. Before the firmware programs them the clock
+     * reads the LXT, which is what the reset values select.
+     *
+     * Leaving refclk unconnected is not neutral: armv7m.c only forwards it to
+     * the systick when it has a source, and QEMU's systick forces CLKSOURCE to
+     * 1 when it does not, so the guest's choice is overridden and the tick is
+     * counted off the CPU clock instead. Every rt_thread_mdelay() in the
+     * firmware then returned about 25x early -- the frame loop came round
+     * every 0.13 s instead of the 3 s it asks for.
+     */
+    s->systickclk = clock_new(OBJECT(machine), "SYSTICKCLK");
+    clock_set_hz(s->systickclk, SF32LB52X_LXT_FRQ);
+    qdev_connect_clock_in(armv7m, "refclk", s->systickclk);
     object_property_set_link(OBJECT(&s->armv7m), "memory",
                              OBJECT(sysmem), &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), &error_fatal);
@@ -305,8 +338,13 @@ static void sifli_sf32lb52x_init(MachineState *machine)
          * Every bank is offered the system clock; only the RCC has a hook
          * that drives it, retuning SysTick as the firmware walks the clock
          * tree. The others ignore it.
+         *
+         * The RCC also gets the tick clock, for the other half of the same
+         * job: SysTick counts that one instead whenever CLKSOURCE is clear,
+         * which is the normal case here.
          */
         sifli_regbank_set_clock(SIFLI_REGBANK(dev), s->sysclk);
+        sifli_regbank_set_tick_clock(SIFLI_REGBANK(dev), s->systickclk);
 
         object_property_add_child(OBJECT(machine), b->bank, OBJECT(dev));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);

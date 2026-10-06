@@ -25,9 +25,9 @@
  * needs it. Anything not listed there is plain storage.
  *
  * One thing a table cannot express, and so needs a write hook, is RCC's
- * effect on the CPU clock: writing CSR, CFGR or DLL1CR changes how fast the
- * machine's SysTick runs. See sf32lb52x_hpsys_rcc_write() and
- * sf32lb52x_rcc_update_clock().
+ * effect on the clocks: writing CSR, CFGR or DLL1CR changes how fast the
+ * machine's CPU runs and how fast the tick clock SysTick counts. See
+ * sf32lb52x_hpsys_rcc_write() and sf32lb52x_rcc_update_clocks().
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -71,6 +71,24 @@ enum {
 
 /* DLL step, from bf0_hal_rcc.c:20-26: freq = stg * step + min. */
 #define SF32LB52X_DLL_STEP_FRQ      24000000
+
+/*
+ * Tick-clock fields: CSR.SEL_TICK picks the source, CFGR.TICKDIV divides it.
+ * Both are plain RCC registers the firmware writes through
+ * HAL_RCC_HCPU_ClockSelect(RCC_CLK_MOD_HP_TICK, ...) and
+ * HAL_RCC_HCPU_SetTickDiv() -- RCC_CLK_MOD_HP_TICK is literally
+ * HPSYS_RCC_CSR_SEL_TICK_Pos, so the select is just a field write
+ * (bf0_hal_rcc.h:181, hpsys_rcc.h:523,540).
+ */
+#define HPSYS_RCC_CSR_SEL_TICK_POS  13
+#define HPSYS_RCC_CSR_SEL_TICK_MSK  (3UL << HPSYS_RCC_CSR_SEL_TICK_POS)
+#define HPSYS_RCC_CFGR_TICKDIV_POS  16
+#define HPSYS_RCC_CFGR_TICKDIV_MSK  (0x3fUL << HPSYS_RCC_CFGR_TICKDIV_POS)
+
+/* What CSR.SEL_TICK can select (bf0_hal_rcc.h:176-178). */
+#define SF32LB52X_RCC_TICK_LP       0
+#define SF32LB52X_RCC_TICK_HRC48    2
+#define SF32LB52X_RCC_TICK_HXT48    3
 
 /* HPSYS_CFG register offsets */
 enum {
@@ -162,10 +180,11 @@ enum {
 };
 
 /*
- * Push the rate the firmware would compute for itself into the machine's
- * clock, so that SysTick keeps matching SystemCoreClock.
+ * Warp both clock outputs of the RCC to the rates the firmware would compute
+ * for itself, so that SysTick keeps matching what the firmware believes.
  *
- * This mirrors HAL_RCC_GetSysCLKFreq() (bf0_hal_rcc.c:1570) followed by
+ * System clock (drives the CPU, and SysTick when it selects HCLK). This
+ * mirrors HAL_RCC_GetSysCLKFreq() (bf0_hal_rcc.c:1570) followed by
  * HAL_RCC_GetHCLKFreq() (:1586): 48 MHz unless CSR selects DLL1, and when it
  * does, the DLL1 stage register gives stg * 24 MHz + 24 MHz; then divide by
  * CFGR's HDIV, where zero counts as one.
@@ -175,18 +194,63 @@ enum {
  * (HAL_RCC_HCPU_ConfigHCLK, reached from the board's HAL_PreInit) finishes by
  * selecting DLL1 at 240 MHz. A machine clock left at its reset 48 MHz would
  * make every delay in the firmware five times too long.
+ *
+ * Tick clock (drives SysTick when it selects the tick clock instead, which is
+ * what this firmware does). The rate is source / TICKDIV, with the source
+ * from CSR.SEL_TICK: HRC48 or HXT48 at 48 MHz, or the LP clock at the LXT's
+ * 32 kHz. rt_hw_systick_init() (drv_common.c:126) asks for HRC48 over 60,
+ * giving the 800 kHz it then programs SysTick's reload against.
+ *
+ * Both have to be modelled from the registers rather than pinned, because the
+ * firmware walks the clock tree at start-up and again on every PM frequency
+ * change; a tick clock fixed at whatever boot happened to leave behind would
+ * silently disagree after the first change.
+ *
+ * Note the rates go out with clock_update_hz(), not clock_set_hz(). The latter
+ * only caches the value on the clock object and leaves every consumer holding
+ * the old one -- clock_set_source() copies a rate when a clock is *connected*,
+ * but nothing after that, so a clock tuned at run time needs the explicit
+ * clock_propagate() that clock_update_hz() does for it. Getting this wrong is
+ * silent: SysTick keeps counting at whatever rate it was connected with, and
+ * the firmware's millisecond is wrong by the ratio.
  */
-static void sf32lb52x_rcc_update_clock(SifliRegBankState *s)
+static void sf32lb52x_rcc_update_clocks(SifliRegBankState *s)
 {
     uint32_t csr, cfgr, dll1cr, div, hz;
 
-    if (!s->clk) {
+    if (!s->clk && !s->tick_clk) {
         return;
     }
 
     csr = sifli_regbank_reg(s, HPSYS_RCC_CSR);
     cfgr = sifli_regbank_reg(s, HPSYS_RCC_CFGR);
     dll1cr = sifli_regbank_reg(s, HPSYS_RCC_DLL1CR);
+
+    if (s->tick_clk) {
+        switch ((csr & HPSYS_RCC_CSR_SEL_TICK_MSK)
+                >> HPSYS_RCC_CSR_SEL_TICK_POS) {
+        case SF32LB52X_RCC_TICK_HRC48:
+            hz = SF32LB52X_HRC48_FRQ;
+            break;
+        case SF32LB52X_RCC_TICK_HXT48:
+            hz = SF32LB52X_HXT48_FRQ;
+            break;
+        default:
+            /* TICK_CLK_LP, the low-power clock. */
+            hz = SF32LB52X_LXT_FRQ;
+            break;
+        }
+        div = (cfgr & HPSYS_RCC_CFGR_TICKDIV_MSK)
+              >> HPSYS_RCC_CFGR_TICKDIV_POS;
+        if (div == 0) {
+            div = 1;
+        }
+        clock_update_hz(s->tick_clk, hz / div);
+    }
+
+    if (!s->clk) {
+        return;
+    }
 
     if ((csr & 3) == SF32LB52X_RCC_SYSCLK_DLL1) {
         if (!(dll1cr & HPSYS_RCC_DLL1CR_EN)) {
@@ -207,22 +271,22 @@ static void sf32lb52x_rcc_update_clock(SifliRegBankState *s)
     if (div == 0) {
         div = 1;
     }
-    clock_set_hz(s->clk, hz / div);
+    clock_update_hz(s->clk, hz / div);
 }
 
 /*
  * The enable set/clear aliases need nothing here: they are declared in the
  * table, and sifli_regbank_write() applies them. What is left is the one
  * thing a table cannot say -- that writing the clock registers changes how
- * fast the CPU runs.
+ * fast the CPU and its tick clock run.
  */
 static bool sf32lb52x_hpsys_rcc_write(SifliRegBankState *s, uint32_t off,
                                       uint32_t value)
 {
     switch (off) {
     /*
-     * The three registers the CPU clock is derived from. They are stored
-     * here rather than by the table so that the new rate goes out in the
+     * The three registers the two clocks are derived from. They are stored
+     * here rather than by the table so that the new rates go out in the
      * same step, and so that a change to any one of them re-evaluates the
      * whole calculation.
      */
@@ -230,7 +294,7 @@ static bool sf32lb52x_hpsys_rcc_write(SifliRegBankState *s, uint32_t off,
     case HPSYS_RCC_CFGR:
     case HPSYS_RCC_DLL1CR:
         sifli_regbank_set_reg(s, off, value);
-        sf32lb52x_rcc_update_clock(s);
+        sf32lb52x_rcc_update_clocks(s);
         return true;
 
     default:

@@ -186,6 +186,16 @@ struct SifliRegBankState {
     Clock *clk;
 
     /*
+     * Optional second output, for the one block that produces two clocks the
+     * machine has to wire separately. The RCC again: besides the CPU clock
+     * above it also divides out a "tick clock", a separate input to SysTick
+     * that software normally selects instead of the CPU clock. Both have to
+     * reach the machine or the firmware's millisecond is wrong -- see
+     * sf32lb52x_rcc_update_clocks().
+     */
+    Clock *tick_clk;
+
+    /*
      * Optional. A second bank whose registers this one's hooks have to read.
      *
      * The AON's GTIMR is the reason: it counts the low-power clock, and which
@@ -219,6 +229,12 @@ void sifli_regbank_set_reg(SifliRegBankState *s, uint32_t off, uint32_t value);
 
 /* Hand a bank the clock its write hook may drive. Call before realize. */
 void sifli_regbank_set_clock(SifliRegBankState *s, Clock *clk);
+
+/*
+ * Same, for a block with a second clock output. Call before realize; a bank
+ * given no tick clock simply never touches s->tick_clk.
+ */
+void sifli_regbank_set_tick_clock(SifliRegBankState *s, Clock *clk);
 
 /*
  * Hand a bank another bank whose registers its hooks may read. Call before

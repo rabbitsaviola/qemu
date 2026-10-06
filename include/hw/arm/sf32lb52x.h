@@ -53,6 +53,15 @@
  */
 #define SF32LB52X_HXT48_FRQ         48000000ULL
 
+/* The internal RC. What RCC_CLK_TICK_HRC48 selects for the tick clock. */
+#define SF32LB52X_HRC48_FRQ         48000000ULL
+
+/*
+ * The 32 kHz crystal: the rate GTIMR counts at, and the source the tick clock
+ * falls back to when CSR.SEL_TICK picks the LP clock.
+ */
+#define SF32LB52X_LXT_FRQ           32768ULL
+
 /* On-chip RAM: HPSYS RAM0 (128K, also DTCM) + RAM1 (128K) + RAM2 (256K) */
 #define SF32LB52X_SRAM_BASE         0x20000000ULL
 #define SF32LB52X_SRAM_SIZE         (512 * KiB)
