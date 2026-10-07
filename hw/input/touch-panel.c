@@ -28,12 +28,125 @@ void touch_panel_reset_hold(TouchPanelState *tp)
     tp->x = 0;
     tp->y = 0;
     tp->down = false;
+    /*
+     * The button is cleared too, though the front-end may still have it
+     * held: after a reset the controller has forgotten the touch, and a
+     * pointer that never left the window is not a finger arriving. The
+     * position goes with it -- a press flushed against a remembered
+     * coordinate would report (0,0) as if that were where it landed.
+     */
+    tp->ui_pressed = false;
+    tp->ui_have_pos = false;
 }
 
 void touch_panel_reset_exit(TouchPanelState *tp)
 {
     qemu_set_irq(tp->int_line, 1);
 }
+
+/*
+ * The front-end that lets the display's own pointer drive the panel, so a
+ * touch can be made by clicking the SDL window instead of by a QMP script.
+ *
+ * Absolute rather than relative, because a panel is: a finger is somewhere,
+ * it does not move by so many pixels. Registering as absolute also puts the
+ * display into absolute mouse mode, so the host cursor is not grabbed and a
+ * click lands where it was aimed.
+ */
+static void touch_panel_ui_event(DeviceState *dev, QemuConsole *src,
+                                 InputEvent *evt)
+{
+    /*
+     * qemu_input_handler_register() was handed this struct rather than a
+     * device, because the handler needs somewhere to keep the press state
+     * and QemuInputHandler has no opaque field of its own. hw/input/hid.c
+     * reaches its state the same way.
+     */
+    TouchPanelState *tp = (TouchPanelState *)dev;
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_ABS: {
+        InputMoveEvent *move = evt->u.abs.data;
+        bool x_axis = move->axis == INPUT_AXIS_X;
+        /* The UI layer works in 0..0x7FFF; a panel is max_x pixels wide. */
+        uint32_t value = qemu_input_scale_axis(move->value,
+                                               INPUT_EVENT_ABS_MIN,
+                                               INPUT_EVENT_ABS_MAX, 0,
+                                               x_axis ? tp->max_x - 1
+                                                      : tp->max_y - 1);
+
+        if (x_axis) {
+            tp->x = value;
+        } else {
+            tp->y = value;
+        }
+        tp->ui_have_pos = true;
+
+        if (tp->ui_pressed) {
+            tp->down = true;
+            tp->report(tp->opaque);
+        }
+        break;
+    }
+    case INPUT_EVENT_KIND_BTN: {
+        InputBtnEvent *btn = evt->u.btn.data;
+
+        if (btn->button != INPUT_BUTTON_LEFT) {
+            break;
+        }
+
+        if (btn->down) {
+            /*
+             * The display sends the button before the position, so
+             * publishing here would report wherever the last click left
+             * off. Wait for the coordinates that follow.
+             */
+            tp->ui_pressed = true;
+        } else if (tp->ui_pressed) {
+            tp->ui_pressed = false;
+            tp->down = false;
+            tp->report(tp->opaque);
+        }
+        /*
+         * A release with no press behind it is dropped. A display sends one
+         * when it loses the pointer without the button ever having been
+         * ours -- and after a reset, which forgot the press, the release
+         * that follows is not a release of anything.
+         */
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/*
+ * The front-end has finished a batch of events. Reached only when something
+ * was delivered to us, and only after all of it was.
+ *
+ * A press that never got coordinates is flushed here. SDL sends the button
+ * and then the position, so by now it has been published and this does
+ * nothing; GTK sends the button and no position at all, taking it from
+ * pointer motion instead, so without this a click that does not move
+ * publishes nothing and the window looks dead. Flushing reports wherever the
+ * pointer last was, which is where the click landed.
+ */
+static void touch_panel_ui_sync(DeviceState *dev)
+{
+    TouchPanelState *tp = (TouchPanelState *)dev;
+
+    if (tp->ui_pressed && !tp->down && tp->ui_have_pos) {
+        tp->down = true;
+        tp->report(tp->opaque);
+    }
+}
+
+static const QemuInputHandler touch_panel_ui_handler = {
+    .name  = "touch panel",
+    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
+    .event = touch_panel_ui_event,
+    .sync  = touch_panel_ui_sync,
+};
 
 void touch_panel_realize(TouchPanelState *tp, DeviceState *dev, Error **errp)
 {
@@ -42,6 +155,25 @@ void touch_panel_realize(TouchPanelState *tp, DeviceState *dev, Error **errp)
     if (tp->irqchip) {
         qdev_connect_gpio_out(dev, 0,
                               qdev_get_gpio_in(tp->irqchip, tp->irq_pin));
+    }
+
+    /*
+     * Registering here rather than in touch_panel_init() is deliberate:
+     * qmp_device_list_properties() instantiates a device and throws it away
+     * again, and a handler registered then would be left pointing at freed
+     * memory.
+     */
+    if (tp->max_x && tp->max_y) {
+        tp->input = qemu_input_handler_register((DeviceState *)tp,
+                                                &touch_panel_ui_handler);
+    }
+}
+
+void touch_panel_unrealize(TouchPanelState *tp)
+{
+    if (tp->input) {
+        qemu_input_handler_unregister(tp->input);
+        tp->input = NULL;
     }
 }
 

@@ -30,6 +30,7 @@
 
 #include "hw/irq.h"
 #include "hw/qdev-core.h"
+#include "ui/input.h"
 
 typedef struct TouchPanelState {
     /*
@@ -41,7 +42,7 @@ typedef struct TouchPanelState {
 
     /*
      * Where that line goes. Both are board wiring, so both are properties
-     * rather than constants -- see DEFINE_PROP_TOUCH_PANEL below.
+     * rather than constants -- see the property contract below.
      */
     DeviceState *irqchip;
     uint32_t irq_pin;
@@ -55,6 +56,31 @@ typedef struct TouchPanelState {
     bool down;
 
     /*
+     * The panel this controller is bonded to. Size belongs to the board, not
+     * to the part: the SDK has one FT6146 driver saying 390x450 and one
+     * FT6336 driver saying 240x240. The UI front-end scales onto this.
+     *
+     * A controller that leaves both zero gets no front-end, since there is
+     * nothing to scale onto.
+     */
+    uint32_t max_x;
+    uint32_t max_y;
+
+    /* True while the front-end has a button held down. */
+    bool ui_pressed;
+
+    /*
+     * Whether a position has ever arrived. Not every front-end sends one
+     * with the button -- GTK sends the button alone and takes the position
+     * from pointer motion -- and flushing a press that has no position
+     * behind it would be inventing a coordinate.
+     */
+    bool ui_have_pos;
+
+    /* The handler the front-end registered with the UI layer. */
+    QemuInputHandlerState *input;
+
+    /*
      * How this controller publishes a touch into its own registers, called
      * with opaque whenever x, y or down changes. Raising the line is the
      * chip's call, made from there with touch_panel_set_int(), because only
@@ -65,17 +91,24 @@ typedef struct TouchPanelState {
 } TouchPanelState;
 
 /*
- * Every controller declares these two properties in its own property list,
+ * Every controller declares these four properties in its own property list,
  * over the TouchPanelState it embeds:
  *
  *   DEFINE_PROP_LINK("irqchip", Ft6146State, tp.irqchip, TYPE_DEVICE,
  *                    DeviceState *),
  *   DEFINE_PROP_UINT32("irq-pin", Ft6146State, tp.irq_pin, 0),
+ *   DEFINE_PROP_UINT32("max-x", Ft6146State, tp.max_x, FT6146_MAX_X),
+ *   DEFINE_PROP_UINT32("max-y", Ft6146State, tp.max_y, FT6146_MAX_Y),
  *
  * They are spelled out rather than hidden behind a macro because every
  * DEFINE_PROP_* in QEMU expands to exactly one property (see
  * include/hw/qdev-properties.h), and a macro that expanded to two would be
  * the only one of its kind.
+ *
+ * All four are the board's to set, and giving a controller a panel size is
+ * what turns its front-end on: without one there is nothing to scale the
+ * window's pointer onto, and a model with no panel behind it has no business
+ * claiming the window's mouse.
  */
 
 /*
@@ -97,6 +130,15 @@ void touch_panel_init(TouchPanelState *tp, Object *obj,
  * riscv-iommu-sys does with its irqchip.
  */
 void touch_panel_realize(TouchPanelState *tp, DeviceState *dev, Error **errp);
+
+/*
+ * The other half of realize: drop the front-end again. The UI layer keeps a
+ * global list of handlers and calls into whatever is on it, so a device that
+ * goes away without unregistering leaves the list pointing at freed memory.
+ * Nothing can unplug an I2C slave today, which is why this is the only time
+ * it matters -- but the list is global and outlives the bus.
+ */
+void touch_panel_unrealize(TouchPanelState *tp);
 
 /*
  * Reset is split the way QEMU splits it generally. Hold forgets the touch and

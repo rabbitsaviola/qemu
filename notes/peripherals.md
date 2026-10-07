@@ -1053,9 +1053,14 @@ C 接口，`-device` 里没有对应写法。所以芯片自己在 realize 里�
 | `address` | 7 位从机地址，默认 `0x38` |
 | `irqchip` | 中断线的落点，link 到 GPIO 控制器（`gpio1`，或全路径 `/machine/gpio1`） |
 | `irq-pin` | 落点里的第几根脚 |
+| `max-x` / `max-y` | 面板的坐标范围，默认 `390`/`450`（驱动里的 `FT_MAX_WIDTH`/`FT_MAX_HEIGHT`） |
 
 `irqchip` 不写就悬空——没接中断线的板子可以什么都不给。写错的名字是正常报错
 （`Device 'nosuchchip' not found`），不是 assert。
+
+`max-x`/`max-y` 同样是板子的事而不是料号的事：SDK 里 FT6146 那个驱动写 390×450，
+FT6336 那个写 240×240，同一颗芯片配不同尺寸的屏是常态。它们还兼着一个开关的
+作用，见 §10.5。
 
 验收跑的是 `sf32lb52-lcd_a128r16_hcpu` 的 `example/rt_driver`，SDK 原样构建、
 一行不改，手指从 QMP 的 `qom-set` 注入（芯片给了 `id=touch`，所以路径是
@@ -1089,6 +1094,105 @@ Touch up   [300,400]
 （PA31 空闲高、下降沿锁存、W1C 清位、主机没读走之前不再产生边沿、读走后松开、
 抬起后 TD_STATUS 归零）。这一项要 qtest 和 QMP 两个协议交错，写不成 bash，单独
 放在 `notes/qtest-touch.py`。
+
+### 10.5 共用的一半，和让鼠标点得动的那一半
+
+**共用的一半在 `hw/input/touch-panel.{c,h}`。** 动机是 SDK 里躺着二十个触控驱动
+（`customer/peripherals/touch_panel/`：cst816、gt911、ft5446u、it7257、tma525b、
+ztw622…），**没有两个共用寄存器映射**，但它们都做同样三件事：从外面收一次注入
+的触摸、把它写进自己的寄存器、按着一条低有效的中断线直到主机把数据读走。这三件
+原本都写在 `ft6146.c` 里，第二颗芯片就只能抄一遍。
+
+抽出去的是**结构体，不是 QOM 基类**，和 `hw/input/hid.c` 同一个形状、同一个理由：
+这些芯片不在同一条总线上。SDK 里的 ADS7846 是 SPI 件，挂在 `TYPE_I2C_SLAVE`
+下面的基类对它一句话也说不上。所以是芯片 `struct` 里嵌一个 `TouchPanelState`
+（`s->tp`），共用层不管你是谁，只管那三件事。
+
+**分界线画在"电平"和"什么时候拉低"之间**，这一条是被证据逼出来的，不是审美：
+
+- 共用层管**电平**：低有效、reset exit 相驱到空闲高、同一状态重复驱动不发新边沿
+  （`touch_panel_set_int()` 里那次早返回，保证板子那边一次触摸只锁一个边沿）。
+- 芯片管**什么时候拉低**：FT6146 是"一次读扫过了 TD_STATUS"，而 GT911 是"主机
+  往 `0x814e` 写 0"（`gt911.c:146` 的 `write_reg(0x814e, 0); //clear tp
+  interrupt`）——写清，不是读清。共用层要是把"读状态寄存器就松线"写死，GT911
+  就得反过来绕开它。所以松开那一下留在 `ft6146_event()` 里。
+
+同理**寄存器映射一律各写各的**：FT5446U 的 P1 四个字节里 X 和 Y 是错位的
+（`P1_XH=0x05/P1_XL=0x06/P1_YH=0x03/P1_YL=0x04`），GT911 是 16 位寄存器
+`0x814e/0x8150` 且往 `0x814e` 写 0 清中断，CST816 是 8 位寄存器（它那个 16 位的
+`FTS_REG_GET_POSI 0xD000` 只在文件里定义了一次、全文没人用），TMA525B 是 PIP 帧，
+ADS7846 干脆走 SPI。这几条不是"暂时不一样"，是抽象不掉的。
+
+**另一半是让 SDL 窗口里点得动的那一半，也在同一个文件里。** 之前只有 QMP 的
+`qom-set` 能注入触摸，窗口里点下去什么都不会发生——QEMU 的指针事件只发给注册过
+`QemuInputHandler` 的设备（`ui/input.c:306`），一个都没注册的模型不在这张名单上。
+现在 `touch_panel_realize()` 顺手注册一个，形状是：
+
+- **绝对坐标（`INPUT_EVENT_MASK_ABS`），不是相对位移。** 面板本来就是个绝对的东西
+  ——手指在某处，不是移动了多少像素。附带的好处是 SDL 那头据此进绝对鼠标模式
+  （`ui/sdl2.c:217-219` 的 `if (!qemu_input_is_absolute(...))`），窗口不抓鼠标。
+- **`max-x`/`max-y` 就是开关。** 报了尺寸才注册：UI 层给的是 `0..0x7FFF`，没有尺寸
+  就没得缩放，而没有面板的模型也没道理去认领窗口的鼠标。`max-x=0` 时
+  `query-mice` 是空数组（第 [13j] 段钉的），指针事件自然也没人接。
+- **注册放在 realize，不放在 `touch_panel_init()`。** `qmp_device_list_properties`
+  会 `object_new()` 一个再扔掉，在 instance_init 里注册的话名单上会留一个指向已
+  释放内存的表项。
+- **按钮和坐标分两次到，顺序是按钮在先。** SDL 先给 `BTN_LEFT` 再给坐标，所以按
+  下那一下只记 `ui_pressed`、不发上报——当场报的话发出去的是上一次点击留下的
+  坐标。抬起那一下才落 `down=false` 并上报。
+- **sync 那一下补报"只有按钮、没有坐标"的按下。** 不是所有前端都跟着按钮给位置：
+  SDL 是（`ui/sdl2.c:340` 的 sync 排在两次 ABS 之后，所以到这里 `down` 已经为真，
+  什么也不用补），**GTK 不是**——`gd_button_event()`（`ui/gtk.c:1109-1111`）只
+  `queue_btn` 再 sync，位置全靠指针移动给。没有这一下，GTK 里按住不动的一击
+  永远不上报，窗口看着像坏的。补报用的是指针上一次的位置，也就是点下去的地方；
+  一个位置都还没有过就不补（`ui_have_pos`），否则等于凭空编一个 `[0,0]`。
+- **注销在 `unrealize` 里。** UI 层的 handler 名单是全局的、比总线活得久，设备没
+  了就调不到了。今天 I2C 从机根本拔不掉（`device_del` 会以 `Bus 'i2c1' does not
+  support hotplugging` 失败，全树没有 i2c 总线注册过 hotplug handler），所以这是
+  照惯例补上的，不是补一个能复现的悬垂。
+
+真机验收换个法子驱动同一条链：不发 `qom-set`，发窗口点击会发的那个 QMP
+`input-send-event`（按钮按下 → 两次 ABS → 按钮抬起），走的正是
+`touch_panel_ui_event()`：
+
+```
+input-send-event {type:btn, down:true, button:left}
+input-send-event {type:abs, axis:x, value:16384}
+input-send-event {type:abs, axis:y, value:32767}
+input-send-event {type:abs, axis:x, value:0}
+input-send-event {type:abs, axis:y, value:0}
+input-send-event {type:btn, down:false, button:left}
+
+Touch down [194,0]
+Touch down [194,449]
+Touch down [0,449]
+Touch down [0,0]
+Touch up   [0,0]
+```
+
+x 和 y 分两行出来，和上一节 `qom-set` 那次是同一个道理（一次事件只带一个轴）。
+数值能对上：面板 390×450，UI 层满量程 `0x7FFF` 映到 `0..389`，所以
+`16384*389/32767 = 194`、`32767 → 449`（`max_y - 1`）；换成
+`-device ft6146,...,max-x=240,max-y=240` 就是 `119` 和 `239`。
+
+上面这段要真机固件才跑得出来，但**同一条路径在 `qtest-sifli.sh` 第 [13i] 段
+是无固件跑的**：那一段直接往 QMP 里塞这串 `input-send-event`，再从 qtest 那头
+读 FT6146 的寄存器，把缩放（`0x4000 → 194`、满量程 `→ 449`）、抬起的归零、
+"按钮单独到就补报"这几格都钉死了。第 [13j] 段另起一个会话钉 opt-in 那一半：
+`max-x=0` 时名单是空的，`max-x=240` 时有一个。
+
+> **钉不住的是 SDL 自己那一步**（`SDL_SetRelativeMouseMode` 到底叫没叫、窗口
+> 坐标怎么变成 `0..0x7FFF`），那要有真窗口才谈得上。`query-mice` 报的
+> `absolute: true` 是"SDL 不抓鼠标"的依据（`qemu_input_is_absolute()` 走的就是
+> 同一个 mask，`ui/input.c:461-468`），[13h] 钉的是它。
+
+> **这台机器上只有它一个指针设备。** handler 注册时没有绑 console，而
+> `qemu_input_find_handler()` 只返回第一个 mask 命中的（`ui/input.c:100-123`），
+> 所以它吃掉所有 console 的 ABS 和 BTN。现在没关系——`sf32lb52x` machine 里
+> 没有 PS/2、没有 USB，`-display` 那几个前端也不注册指针设备。要是哪天加了
+> `usb-tablet`，FT6146 在 machine init 时就 realize，顺序上永远排在前面，对方的
+> 鼠标会静默失效；到那时候得用 `qemu_input_handler_bind()` 把它限定到 LCDC 那个
+> console 上。
 
 ---
 

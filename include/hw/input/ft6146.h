@@ -59,8 +59,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Ft6146State, FT6146)
 
 /*
  * Coordinate range of the panel this controller is bonded to, the driver's
- * FT_MAX_WIDTH/FT_MAX_HEIGHT. Nothing in the model uses them; they are here
- * so a reader can tell what a coordinate means.
+ * FT_MAX_WIDTH/FT_MAX_HEIGHT. These are the defaults for the max-x and max-y
+ * properties: the model uses them to scale the window's pointer onto the
+ * panel, so a board with a differently sized panel overrides them rather
+ * than editing this.
  *
  * The driver's mirroring helper, ft6146_correct_pos(), would turn x into
  * 390 - x and y into 450 - y -- but this SDK never calls it (it is defined

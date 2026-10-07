@@ -68,6 +68,18 @@ FT6146_TD_STATUS = 1     # 在 point_data[] 里的下标，即寄存器 0x02
 FAILED = 0
 RESULTS = []
 
+# [13i] 往 QMP 里塞的就是窗口会塞的那几个事件。
+BTN_LEFT_DOWN = {"type": "btn", "data": {"down": True, "button": "left"}}
+BTN_LEFT_UP = {"type": "btn", "data": {"down": False, "button": "left"}}
+
+
+def ABS_X(value):
+    return {"type": "abs", "data": {"axis": "x", "value": value}}
+
+
+def ABS_Y(value):
+    return {"type": "abs", "data": {"axis": "y", "value": value}}
+
 
 def check(what, want, got):
     global FAILED
@@ -140,6 +152,50 @@ class Qmp:
             self.cmd("qom-set", path="/machine/peripheral/touch",
                      property="touch-" + prop, value=value)
 
+    def send(self, events):
+        return self.cmd("input-send-event", events=events)
+
+    def mice(self):
+        return self.cmd("query-mice") or []
+
+
+def mice_with_geometry(geom):
+    """换个面板尺寸挂一颗芯片，问它有没有认领窗口的鼠标。
+
+    max-x/max-y 是 realize 之前定好的，换尺寸只能换一个 QEMU 进程。这一头
+    不需要 qtest，问完就退。
+    """
+    d = tempfile.mkdtemp(prefix="qtest-touch-geom-")
+    sock = os.path.join(d, "qmp.sock")
+    errlog = os.path.join(d, "stderr")
+    with open(errlog, "w") as errf:
+        proc = subprocess.Popen(
+            [QEMU, "-M", "sf32lb52x", "-display", "none", "-serial", "none",
+             "-accel", "qtest",
+             "-device", "ft6146,id=touch,bus=i2c1,irqchip=gpio1,irq-pin=31,"
+                        + geom,
+             "-qmp", "unix:%s,server,nowait" % sock],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errf)
+
+    qmp = None
+    try:
+        for _ in range(200):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        qmp = Qmp(sock)
+        return qmp.mice()
+    finally:
+        try:
+            if qmp is not None:
+                qmp.cmd("quit")
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
 
 def ft6146_read(qt, reg, length):
     """照抄驱动 read_regs()：写寄存器指针，STOP，再重新 START 读。
@@ -179,15 +235,21 @@ def main():
     # 真机验收那条 -device（bus 选 I2C1，中断接 GPIO1 的 PA31）。id=touch
     # 只是给 QMP 一个稳定的路径来注入触摸。
     #
-    # -S：开机就停住。这一项不跑固件，CPU 放着自己跑会从地址 0 取指令、
-    # 然后 Lockup 到 HardFault 把 QEMU 整个 abort 掉（`-qtest` 不隐含停机）。
-    # 停了之后 MMIO 照样读写——qtest 走的是 address_space，不需要 CPU。
-    # qtest-sifli.sh 里那几段是同一件事，用的是 -accel qtest。
+    # 这一项不跑固件，但 QEMU 不能是 `-S` 停着的：QMP 的 input-send-event 在
+    # runstate 不是 running 时会被 "VM not running" 拒掉（ui/input.c:145），
+    # 而 [13i] 那一段要靠它来驱动窗口那条路径。
+    #
+    # 所以这里是 `-accel qtest` 而不是 `-S`。差别在于 CPU 到底跑不跑：默认的
+    # TCG 下它从地址 0 取指令、Lockup 到 HardFault 把 QEMU 整个 abort 掉；
+    # accel/qtest 用的是 dummy-cpus（accel/dummy-cpus.c），vCPU 只等事件、
+    # 一条指令都不执行，所以既到得了 RUN_STATE_RUNNING，也不会跑飞。MMIO
+    # 照样读写——qtest 走的是 address_space，不需要 CPU。
     with open(errlog, "w") as errf:
         proc = subprocess.Popen(
             [QEMU, "-M", "sf32lb52x", "-display", "none", "-serial", "none",
+             "-accel", "qtest",
              "-device", "ft6146,id=touch,bus=i2c1,irqchip=gpio1,irq-pin=31",
-             "-S", "-qtest", "stdio",
+             "-qtest", "stdio",
              "-qmp", "unix:%s,server,nowait" % sock],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=errf, text=True)
@@ -274,6 +336,67 @@ def main():
         qt.writel(I2C2_BASE + I2C_TCR, TCR_START)
         check("I2C2 上无人应答，SR 置 BED(bit10)", 1 << 10,
               qt.readl(I2C2_BASE + I2C_SR) & (1 << 10))
+
+        print("  [13h] 面板对窗口可见：报了尺寸才注册，且是绝对坐标")
+        # 前端是 opt-in 的：芯片报了 max-x/max-y 才注册 handler，因为没
+        # 尺寸就没得缩放。而 SDL 那头看的是 handler 的 mask 里有没有 ABS，
+        # 有就进绝对鼠标模式、不抓鼠标。两件事一起钉——少哪一件，现象都是
+        # "窗口里点下去没反应"，和在真机上看不出区别。
+        mice = qmp.mice()
+        check("注册了一个指针设备", 1, len(mice))
+        check("叫 touch panel，且报绝对坐标", 1,
+              int(bool(mice) and mice[0]["name"] == "touch panel"
+                  and mice[0]["absolute"]))
+
+        print("  [13i] 一次窗口点击：按钮 → 两次 ABS → 按钮抬起")
+        # 走的是窗口那条路（input-send-event → ui/input.c 的 handler →
+        # touch_panel_ui_event），不是 qom-set。面板 390x450，UI 层满量程
+        # 0x7FFF 映到 0..389 / 0..449，所以下面两个数是能算出来的。
+        #
+        # 从这里开始 ui_have_pos 还是假：前面几段都走 qom-set，只有窗口这条
+        # 路才会置它。
+        qt.writel(GPIO_BASE + GPIO_ISR, TOUCH_BIT)
+        qmp.send([BTN_LEFT_DOWN])
+        check("只按按钮、还没有过坐标：不报（没位置可报）", 0,
+              qt.readl(GPIO_BASE + GPIO_ISR))
+
+        # 坐标和 SDL 一样一次一个轴，各发一条。
+        qmp.send([ABS_X(0x4000)])
+        qmp.send([ABS_Y(0x7FFF)])
+        check("坐标到了：锁存一条下降沿", TOUCH_BIT,
+              qt.readl(GPIO_BASE + GPIO_ISR))
+        data = ft6146_read(qt, 0x01, FT6146_READ_LEN)
+        check("TD_STATUS 报 1 个触点", 1, data[FT6146_TD_STATUS])
+        check("x：0x4000 映到 0..389 上 = 194", 194,
+              ((data[2] & 0x0f) << 8) | data[3])
+        check("y：满量程落在 max_y-1 = 449", 449,
+              ((data[4] & 0x0f) << 8) | data[5])
+        check("event 位是 CTP_DOWN(0)", 0, data[2] >> 6)
+
+        qmp.send([BTN_LEFT_UP])
+        data = ft6146_read(qt, 0x01, FT6146_READ_LEN)
+        check("抬起：TD_STATUS 归零", 0, data[FT6146_TD_STATUS])
+
+        # 再点一次，这次只发按钮、不发坐标——GTK 就是这样（gtk.c:1111 的
+        # gd_button_event 只 queue_btn 再 sync，位置全指望指针移动）。有位置
+        # 可用了，sync 那一下就得把这个按下补报出来，报在上一次的位置上。
+        qt.writel(GPIO_BASE + GPIO_ISR, TOUCH_BIT)
+        qmp.send([BTN_LEFT_DOWN])
+        check("有位置了：光按按钮也报（sync 补报）", TOUCH_BIT,
+              qt.readl(GPIO_BASE + GPIO_ISR))
+        data = ft6146_read(qt, 0x01, FT6146_READ_LEN)
+        check("报的就是上一次那个位置 x = 194", 194,
+              ((data[2] & 0x0f) << 8) | data[3])
+        qmp.send([BTN_LEFT_UP])
+
+        print("  [13j] 没报尺寸的芯片不认领鼠标（opt-in 的那一半）")
+        # [13h] 用的是默认尺寸，所以它钉的是"默认非零 → 注册"；把
+        # touch-panel.c 里那个 `if (tp->max_x && tp->max_y)` 删掉它照样全过。
+        # 这一格换个尺寸另起一个会话，两个方向都钉。
+        check("max-x=0：没有指针设备", 0,
+              len(mice_with_geometry("max-x=0,max-y=0")))
+        check("240x240：照样注册一个", 1,
+              len(mice_with_geometry("max-x=240,max-y=240")))
 
         for line in RESULTS:
             print(line)

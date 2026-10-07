@@ -135,6 +135,13 @@ static void ft6146_realize(DeviceState *dev, Error **errp)
     touch_panel_realize(&s->tp, dev, errp);
 }
 
+static void ft6146_unrealize(DeviceState *dev)
+{
+    Ft6146State *s = FT6146(dev);
+
+    touch_panel_unrealize(&s->tp);
+}
+
 static void ft6146_instance_init(Object *obj)
 {
     Ft6146State *s = FT6146(obj);
@@ -166,6 +173,16 @@ static const Property ft6146_properties[] = {
     DEFINE_PROP_LINK("irqchip", Ft6146State, tp.irqchip, TYPE_DEVICE,
                      DeviceState *),
     DEFINE_PROP_UINT32("irq-pin", Ft6146State, tp.irq_pin, 0),
+
+    /*
+     * The panel this controller is bonded to, the driver's FT_MAX_WIDTH and
+     * FT_MAX_HEIGHT. The defaults are the ones ft6146.c uses in the SDK, but
+     * the size is the board's to state, because the same part turns up
+     * behind differently sized panels. Stating it is also what turns on the
+     * UI front-end, so the window's pointer can drive the panel.
+     */
+    DEFINE_PROP_UINT32("max-x", Ft6146State, tp.max_x, FT6146_MAX_X),
+    DEFINE_PROP_UINT32("max-y", Ft6146State, tp.max_y, FT6146_MAX_Y),
 };
 
 static void ft6146_class_init(ObjectClass *klass, const void *data)
@@ -178,6 +195,7 @@ static void ft6146_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = ft6146_reset_hold;
     rc->phases.exit = ft6146_reset_exit;
     dc->realize = ft6146_realize;
+    dc->unrealize = ft6146_unrealize;
     dc->desc = "FocalTech FT6146 touch controller";
 
     sc->event = ft6146_event;
