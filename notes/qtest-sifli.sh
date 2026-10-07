@@ -295,6 +295,126 @@ echo "[8b] EPIC：图层混合"
 check 0x8000fbef "白底混出 0xFBEF，黑底混出 0x8000"
 
 echo
+echo "[8c] EPIC：VL 图层的旋转与缩放"
+# 这两段钉的是 VL 的变换单元，寄存器值都按 HAL 会算出来的样子摆，期望像素
+# 手工可推。源图 2x2 RGB565 放在 0x20002000（行距 4 字节）：
+#   (0,0)=0xF800 红  (1,0)=0x07E0 绿
+#   (0,1)=0x001F 蓝  (1,1)=0xFFFF 白
+# 画布清成 CANVAS_BG=0x80（B 通道），RGB565 里是 0x0010。
+#
+# 旋转：HAL 把输入角度（0.1 度）除以 10 再下发，90 度就是 ROT_DEG=90，并且
+# 用 DEG_FORCE 送进 |sin|=1/|cos|=0（Q1.12，4096 和 0，见 §7.5 与文件头）。
+# 源绕 pivot(2,2) 转 90 度、再平移，落在 TL(0,0) 起 5x5 的窗口里；反算
+# src_x = ly-1、src_y = 3-lx，于是四个源像素只落在 (2,1)(3,1)(2,2)(3,2)。
+out=$(run \
+    'write 0x20002000 0x8 0x00f8e0071f00ffff' \
+    'writel 0x50007018 0x00000080' \
+    'writel 0x50007010 0x00000000' \
+    'writel 0x50007014 0x00040004' \
+    'writel 0x5000701c 0x40040000' \
+    'writel 0x50007020 0x00000000' \
+    'writel 0x50007024 0x00040004' \
+    'writel 0x50007028 0x00010001' \
+    'writel 0x50007030 0x20002000' \
+    'writel 0x50007034 0x00000168' \
+    'writel 0x5000703c 0x00010000' \
+    'writel 0x50007040 0x00010000' \
+    'writel 0x50007048 0x30000000' \
+    'writel 0x50007108 0x80040004' \
+    'writel 0x5000710c 0x00020002' \
+    'writel 0x50007110 0x00010001' \
+    'writel 0x50007114 0x00000000' \
+    'writel 0x50007118 0x00000000' \
+    'writel 0x500070f8 0x00000000' \
+    'writel 0x500070fc 0x20003000' \
+    'writel 0x50007100 0x00000000' \
+    'writel 0x50007000 0x00000001' \
+    'readl 0x20003000' \
+    'readl 0x2000300e' \
+    'readl 0x20003018')
+vals=$(echo "$out" | grep '^OK 0x')
+i=0
+check 0x00100010 "旋转 90°：没被源盖住的地方留 CANVAS_BG"
+check 0xf800001f "旋转 90°：源 (0,1) 蓝 / (0,0) 红 落到 (2,1)(3,1)"
+check 0x07e0ffff "旋转 90°：源 (1,1) 白 / (1,0) 绿 落到 (2,2)(3,2)"
+
+# 缩放：2 倍放大。HAL 的输入是 1024=1.0 的定点，放大 2 倍写 512，换算到
+# 寄存器是 512<<6 = 0x8000（16.16 的 0.5）。源不动，(init=0) 时反算
+# src = (lx * 0x8000) >> 16 = lx/2，所以 2x2 的源变成 4x4 的方块。
+out=$(run \
+    'write 0x20002000 0x8 0x00f8e0071f00ffff' \
+    'writel 0x50007018 0x00000080' \
+    'writel 0x50007010 0x00000000' \
+    'writel 0x50007014 0x00030003' \
+    'writel 0x5000701c 0x40040000' \
+    'writel 0x50007020 0x00000000' \
+    'writel 0x50007024 0x00030003' \
+    'writel 0x50007028 0x00010001' \
+    'writel 0x50007030 0x20002000' \
+    'writel 0x50007034 0x00000000' \
+    'writel 0x5000703c 0x00008000' \
+    'writel 0x50007040 0x00008000' \
+    'writel 0x50007048 0x00000000' \
+    'writel 0x50007114 0x00000000' \
+    'writel 0x50007118 0x00000000' \
+    'writel 0x500070f8 0x00000000' \
+    'writel 0x500070fc 0x20003000' \
+    'writel 0x50007100 0x00000000' \
+    'writel 0x50007000 0x00000001' \
+    'readl 0x20003000' \
+    'readl 0x20003004' \
+    'readl 0x20003010' \
+    'readl 0x20003014')
+vals=$(echo "$out" | grep '^OK 0x')
+i=0
+check 0xf800f800 "放大 2×：源 (0,0) 红铺成 (0,0)(1,0)"
+check 0x07e007e0 "放大 2×：源 (1,0) 绿铺成 (2,0)(3,0)"
+check 0x001f001f "放大 2×：源 (0,1) 蓝落到第 2 行前两个"
+check 0xffffffff "放大 2×：源 (1,1) 白落到第 2 行后两个"
+
+echo
+echo "[8d] EPIC：内存图层的缩小（RGB565 源）"
+# 钉的是 epic_draw_layer_transformed() 的缩小路径——[8c] 只钉了放大 2×，
+# 内存路径的缩小在 qtest 里一直是空的。源 4x4 RGB565 放在 0x20002000，
+# 行距 4 像素 = 8 字节（VL_CFG 的 width 字段就是这个**字节**数，见 [8c]），
+# 画布 4x4，不覆盖的地方留 CANVAS_BG=0x0010：
+#   row0 红 绿 蓝 白     row2 绿 蓝 白 红
+#   row1 row3 是干扰行，缩小 2× 不该采到它们
+# 缩小 2×：SCALE_RATIO = 0x20000（16.16 的 2.0），init = 0，反算
+#   src = (0 + lx*0x20000) >> 16 = 2*lx，只采偶数下标，正好是四个角
+#   (0,0)红 (2,0)蓝 (0,2)绿 (2,2)白，缩成 2x2 贴在 TL(0,0)。
+out=$(run \
+    'write 0x20002000 0x20 0x00f8e0071f00ffff1111222233334444e0071f00ffff00f85555666677778888' \
+    'writel 0x50007018 0x00000080' \
+    'writel 0x50007010 0x00000000' \
+    'writel 0x50007014 0x00030003' \
+    'writel 0x5000701c 0x40080000' \
+    'writel 0x50007020 0x00000000' \
+    'writel 0x50007024 0x00010001' \
+    'writel 0x50007028 0x00030003' \
+    'writel 0x50007030 0x20002000' \
+    'writel 0x50007034 0x00000000' \
+    'writel 0x5000703c 0x00020000' \
+    'writel 0x50007040 0x00020000' \
+    'writel 0x50007048 0x00000000' \
+    'writel 0x50007114 0x00000000' \
+    'writel 0x50007118 0x00000000' \
+    'writel 0x500070f8 0x00000000' \
+    'writel 0x500070fc 0x20003000' \
+    'writel 0x50007100 0x00000000' \
+    'writel 0x50007000 0x00000001' \
+    'readl 0x20003000' \
+    'readl 0x20003008' \
+    'readl 0x20003010' \
+    'readl 0x20003018')
+vals=$(echo "$out" | grep '^OK 0x')
+i=0
+check 0x001ff800 "缩小 2×：源 (0,0) 红 / (2,0) 蓝 -> 输出行 0"
+check 0xffff07e0 "缩小 2×：源 (0,2) 绿 / (2,2) 白 -> 输出行 1"
+check 0x00100010 "缩小 2×：输出行 2 在框外，留 CANVAS_BG"
+check 0x00100010 "缩小 2×：输出行 3 在框外，留 CANVAS_BG"
+
+echo
 echo "[9] EZIP：私有格式（真的去跑 SDK 的 ezip_linux）"
 # 这一节验的是模型和外部工具之间那段：把位流交给工具、把工具吐出来的
 # 4 字节头解析成宽高、再把头后面那 7548 个像素放进 DST。
@@ -440,6 +560,63 @@ vals=$(echo "$out" | grep '^OK 0x')
 i=0
 check 0x1 "INT_STA 报 END 而不是 BTYPE_ERR"
 check 0x1 "INT_MASK 报 END 而不是 BTYPE_ERR"
+
+echo
+echo "[9d] EZIP → EPIC：co-engine 图层带缩放"
+# 和 [9b] 同一条路，只是多写一条 SCALE_RATIO。HAL 允许缩放 co-engine 图层，
+# 只拒旋转（bf0_hal_epic.c:6196-6204），缩放时 EPIC 照常被编程：像素来源换
+# 了，反算不变，采样点从"SRC 里的 (sx,sy)"改成"帧内的 (sx-start_col,
+# sy-start_row)"，落在帧外的不画。
+#
+# 窗口还是源图第 10 行 x=28..31 那 4 个像素，H=0x8000 表示一个源像素铺两个
+# 输出像素。图层 TL=(0,0)、BR=(63,10)，输出 x 反算回源 x>>1：
+#   x=56,57 -> 源 28 -> 帧[0] alpha=255 -> 0xffc9
+#   x=58,59 -> 源 29 -> 帧[1] alpha=255 -> 0xb4e6
+#   x=60,61 -> 源 30 -> 帧[2] alpha=248 -> 混到黑底 0x0820
+#   x=62,63 -> 源 31 -> 帧[3] alpha=243 -> 混到黑底 0x5aa2
+# x<56 反算出的源坐标小于 start_col=28，在帧外，不画（底由 bypass 保住，
+# 是全 0 内存）。y 不缩放（0x10000），start_row=10 所以画在第 10 行。
+# 画布 64x11，读点 (10*64+56)*2 = 1392 = 0x570。
+if [ ! -x "$TOOL" ] || [ ! -r "$ASSET_SRC" ]; then
+    echo "  [SKIP] 缺 $TOOL 或 SDK 资产，设 SIFLI_SDK 指向 SDK 根目录可打开"
+else
+    src_hex=$(strip_array "$ASSET_SRC")
+    src_len=$(( ${#src_hex} / 2 ))
+    out9d=$(printf '%s\n' \
+            "write 0x20004000 $src_len 0x$src_hex" \
+            'writel 0x50006004 0x20004000' \
+            'writel 0x5000600c 0x00000000' \
+            'writel 0x50006014 0x001c000a' \
+            'writel 0x50006018 0x001f000a' \
+            'writel 0x50006000 0x00000001' \
+            'writel 0x500070f8 0x00000000' \
+            'writel 0x500070fc 0x20005000' \
+            'writel 0x50007100 0x00000000' \
+            'writel 0x50007010 0x00000000' \
+            'writel 0x50007014 0x000a003f' \
+            'writel 0x50007018 0x01000000' \
+            'writel 0x5000701c 0x40000002' \
+            'writel 0x50007020 0x00000000' \
+            'writel 0x50007024 0x000a003f' \
+            'writel 0x5000703c 0x00008000' \
+            'writel 0x50007040 0x00010000' \
+            'writel 0x50007114 0x00000000' \
+            'writel 0x50007118 0x00000000' \
+            'writel 0x500070d0 0x00000001' \
+            'writel 0x50007000 0x00000001' \
+            'readl 0x20005570' \
+            'readl 0x20005574' \
+            'readl 0x20005578' \
+            'readl 0x2000557c' \
+        | timeout 90 "$QEMU" -M "sf32lb52x,ezip-tool=$TOOL" -display none \
+              -serial none -qtest stdio 2>/dev/null | tr -d '\r')
+    vals=$(echo "$out9d" | grep '^OK 0x' | tail -4)
+    i=0
+    check 0xffc9ffc9 "源 28 铺成 x=56,57"
+    check 0xb4e6b4e6 "源 29 铺成 x=58,59"
+    check 0x08200820 "源 30（alpha 248）铺成 x=60,61"
+    check 0x5aa25aa2 "源 31（alpha 243）铺成 x=62,63"
+fi
 
 echo
 echo "[10] LCDC：命令路径（控制器问面板「你是谁」）"

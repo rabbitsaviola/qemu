@@ -286,6 +286,100 @@ check done
 输出给 EPIC 的作业报错误位会把固件钉死在 `while (epic->coeng_state)`。
 这是模型上真踩过的坑，见 `peripherals.md` §6.5。
 
+#### `single_mode` —— co-engine 图层**带缩放**（EZIP + `SCALE_RATIO`）
+
+上面的 `example_ezip` 用例是 1:1 的 co-engine。带缩放的那条在
+`example/rt_device/gpu/single_mode`：`scale_down_demo(multiple, 205, 208)`
+（`src/main.c:186`）把同一份 EZIP 资产按 `scale_x = scale_y = 1024 * multiple`
+缩放贴到 `buffer0`（390×450 RGB565），`main()` 依次跑 1/2/3 倍
+（`src/main.c:547-551`），每次 `drv_epic_blend()` 返回后打一行 `show lcd ...`
+——**这一行就是"`buffer0` 已经画好了"的信号**。
+
+```bash
+cd <SDK>/example/rt_device/gpu/single_mode/project
+scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+```
+
+这个例程也不打印校验和，所以还是"把 `buffer0` 从内存里读回来自己比"。难点是
+时机：`show lcd ...` 之后固件马上 `lcd_display_update()` 接着往下跑。用
+`-gdb tcp::<port> -S` 起来、盯着串口文件，看到那一行就打断冻住 vCPU，再按从
+ELF 取的符号地址读 `buffer0`。**别写死地址**——重编一次就变：
+
+```bash
+arm-none-eabi-nm -S <SDK>/example/rt_device/gpu/single_mode/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf | grep -w buffer0
+# 604ab680 00055b18 b buffer0        （351000 字节 = 390*450*2）
+```
+
+```bash
+timeout 300 ~/build-sifli/qemu-system-arm -M sf32lb52x,ezip-tool=<SDK>/tools/png2ezip/ezip_linux \
+  -device sifli-panel -display none \
+  -serial file:/tmp/scale.log \
+  -monitor unix:/tmp/scale-mon.sock,server,nowait \
+  -gdb tcp::45505 -S \
+  -kernel <SDK>/example/rt_device/gpu/single_mode/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
+```
+
+一条 gdb RSP 客户端连着 `:45505`：`cont`，轮询 `/tmp/scale.log` 里
+`show lcd ...` 的次数（第 n 次就是 `multiple = (n - 1) % 3 + 1`，`main()` 那个
+`while(1)` 会一轮轮重来），出现后打断、读 `buffer0` 那 351000 字节——**读内存
+时 CPU 必须停住**。想顺带截 LCD 那份就发 `screendump /tmp/scale.ppm`（走
+monitor socket）；**390 像素宽时 PPM 的行距是 1172 不是 1170**。
+
+期望（**非黑**包围盒，坐标是 `buffer0` 里的绝对位置）：
+
+| multiple | bbox | 含义 |
+|---|---|---|
+| 1 | (92,121) 205×208 | 不缩放，1:1 贴上去（co-engine 那条未变换路；**寄存器读不出这一档**，见下） |
+| 2 | (143,173) 103×104 | 整个 205×208 缩成 2× |
+| 3 | (160,191) 69×69 | 整个 205×208 缩成 3×（`BR` 由 HAL 取整成 69×69，纵向相位由 `SCALE_INIT_CFG2` = 0x1fffe 偏 1 行） |
+
+逐像素比法：宿主跑一次同一个 `ezip_linux` 把资产解出来（容器头给宽高，见
+`peripherals.md` §6.3），再按寄存器反算采样点对——`buffer0` 上图层
+`TL + (x, y)` 处应等于资产
+`((SCALE_INIT_X + x*SCALE_RATIO_H) >> 16, (SCALE_INIT_Y + y*SCALE_RATIO_V) >> 16)`
+处的像素。寄存器值在冻住的那一刻从 `0x50007020` 起读（TL/BR、`0x5000703c`/`:40`
+是 `SCALE_RATIO_H/V`、`0x50007114`/`:118` 是 `SCALE_INIT_CFG1/2`）。
+
+**`multiple = 1` 这一档不能按寄存器判。** 曾经这里写的是"`SCALE_RATIO` 是
+0x10000、`SCALE_INIT` 全 0"，实抓**不是**：m1 冻住时读到 `SCALE_RATIO_H` =
+0x140、`VL_EXTENTS` 是 `max_col` = `max_line` = 2、`VL_TL_POS` = (0,0)、
+`VL_BR_POS` = (389,449)——整画布，根本不是这次作业的值。原因是未变换的
+co-engine 路 HAL 压根不碰 VL 那几个寄存器，读回来的是**上一个作业的残留**；
+m2/m3 才自洽（`EXTENTS` 的 max_col/max_line = 204/207，正好对上 205×208 的资产）。
+所以 m1 只按内容判：包围盒 (92,121) 205×208、且与当场解出来的资产 1:1 逐像素
+相等（42640/42640），负对照在这一档没有意义——它本来就是"1:1 原样贴"。
+
+#### `single_mode` —— **内存图层**带缩放（RGB565 + `SCALE_RATIO`）
+
+上面那节缩的是 co-engine 那条路（源是 EZIP 解出来的帧）。源换成**内存里的
+普通图层**走的是另一条代码路径，`single_mode` 里也有：`scale_memory_demo(multiple)`
+（`src/main.c:243`）把一张 270×270 的 RGB565 位图 `mask_2_data` 按
+`scale_x = scale_y = 1024 * multiple` 贴到 `buffer0`，`main()` 跑 2 倍和 3 倍
+（`src/main.c:602-604`），每轮 `drv_epic_blend()` 返回后打一行
+`scale_mem start--- N`——**这一行就是"`buffer0` 已经画好了"的信号**。
+
+同一份固件、同一个 ELF，所以符号地址的取法（`nm -S` 取 `buffer0` 和
+`mask_2_data`）和起机器的方式跟上一节完全一样，只是盯的 marker 换成
+`scale_mem start--- N`。`mask_2_data` 也要从 guest 内存里读——它在 PSRAM 的
+`.data` 里，开板之后启动代码才从 flash 拷过去，**复位后立刻读是零**。
+
+一次实抓的样子（`VL_EXTENTS` 的 max_col/max_line 都 = 269，源就是 270×270）：
+
+| multiple | `VL_TL_POS` | 框 | `SCALE_RATIO_H/V` | `SCALE_INIT_CFG1/2` | 框内非黑 |
+|---|---|---|---|---|---|
+| 2 | (128,158) | 135×135 | 0x20000 | 0x10000 / 0x10000 | 7305 |
+| 3 | (150,180) | 90×90 | 0x30000 | 0x0 / 0x0 | 3249 |
+
+这张表只当**量级**参考，别当断言：`SCALE_INIT` 那两列尤其不要写死——它由 HAL
+按相位算出来，抓的时机不同就可能不一样。真正稳的是 `SCALE_RATIO`（2×/3×）、
+框的大小和"框内非黑"的像素数。判据也不比这些常数，一律按冻住那一刻的寄存器
+反算——常数写进断言，模型改了寄存器用法也照样"通过"。
+
+逐像素比法和上一节一样（按寄存器反算采样点），只是源图换成 `mask_2_data`。
+**这一档必须看"框内非黑"那个数**：整块画布大部分是黑的，拿 m3 的帧去顶 m2 的
+寄存器，全帧还有 0.9590，离 0.97 的门槛很近；框内非黑立刻掉到 0.0311。全帧
+那个数只用来证明框外确实是黑的。负对照（1:1 原样贴）实测 0.3866 / 0.4873。
+
 #### `example/rt_driver` —— 整条显示链路
 
 前面几项各钉一个环节；这一项走完整条**显示**链路：HAL 读数 → 驱动认屏 → PSRAM
@@ -476,6 +570,19 @@ SIFLI_REAL_FW=- bash notes/verify-sifli.sh       # 跳过固件那一项
 第 10、11 项各自要一个例程固件，路径不合适就用 `SIFLI_EZIP_FW=` / `SIFLI_EPIC_FW=`
 覆盖（`SIFLI_EZIP_TOOL=` 指宿主的 `ezip_linux`）；固件或工具不在就整项 `[SKIP]`，
 不会假装通过。
+
+`verify-sifli.sh` 到真实板子固件为止。模型本身另有两个脚本，都是同一个口径
+（全过退出码 0，缺资产 `[SKIP]` 不算失败）：
+
+| 脚本 | 项数 | 管什么 |
+|---|---|---|
+| `notes/qtest-sifli.sh` | 21 | 按人写的值敲寄存器，查模型**读写路径**。不需要 SDK，进 CI |
+| `notes/realboard/run.sh` | 3 场景 | 真实板子固件，查 **HAL 自己算出来的寄存器**对不对。见 §2② |
+
+```bash
+SIFLI_QEMU_BUILD=~/build-sifli bash notes/qtest-sifli.sh
+bash notes/realboard/run.sh
+```
 
 十一项检查，全部通过退出码 0，可直接进 CI：
 

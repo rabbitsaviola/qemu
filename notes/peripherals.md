@@ -554,9 +554,11 @@ vCPU 停住几十毫秒。只有私有格式走这条路。工具路径没给或
 （`bf0_hal_ezip.c:288-324`），列在 bit31:16、行在 bit15:0。硬件只解这一块矩形
 ——图层被画布裁掉时用不着整幅图。模型这边宿主工具总会吐整幅，所以按窗口裁。
 窗口原点是源图的 `(start_col, start_row)`，而图层的 `TL_POS` 是源图 `(0,0)`
-落画布的位置，于是帧落在 `TL_POS + 窗口原点`。（这里假定图层不旋转也不缩放——
-模型两者都没实现，§7.5；HAL 那边至少拒绝 EZIP 图层的旋转，
-`bf0_hal_epic.c:6200`，缩放不拒。）
+落画布的位置，于是**未缩放**时帧落在 `TL_POS + 窗口原点`。带缩放时帧不走这个
+落点，而是和普通图层一样过 VL 的变换单元（§7.7）：输出像素先反算成源坐标
+`s`，再取帧内 `(s - 窗口原点)` 那个像素，落在窗口外的就不画。HAL 允许缩放
+EZIP 图层、只拒绝旋转它（`bf0_hal_epic.c:6196-6204`），缩放时 `SCALE_RATIO`、
+`SCALE_INIT`、`EXTENTS`、TL/BR 照常下发。
 
 **像素按 ARGB8888 喂给 EPIC。** HAL 把 EZIP 图层的格式一律折成
 `EPIC_L0_CFG_FMT_ARGB8888`（`bf0_hal_epic.c:722`），而工具产出的是
@@ -638,11 +640,13 @@ HAL 的写法（`bf0_hal_epic.c:1897`、`:4025`）是：
 `ALL_BLENDING_BYPASS` 且把 `CANVAS_BG` 留在 0——照清不误的话，会把马上要读的
 目标先擦掉。
 
-### 7.5 不做的事（记一笔、照常置 STATUS=0，但画出来的是错的）
+### 7.5 仍不做的事（记一笔、照常置 STATUS=0，但画出来的是错的）
 
-旋转（`VL_ROT`、`*_ROT_M_*`）、缩放（`SCALE_RATIO_*`、`SCALE_INIT_*`）、YUV
-输入、dither、`MASK_*`、A8/A4/A2/L8 源格式（要色彩坐标引擎和调色板），以及
-`AHB_CTRL.DESTINATION = LCD`（只做写内存）。
+镜像（`VL_MISC_CFG.H_MIRROR`/`V_MIRROR`：HAL 支持，但 SDK 自己的驱动没有一处
+置它）、YUV 输入、dither、`MASK_*`、A8/A4/A2/L8 源格式（要色彩坐标引擎和调色
+板）、co-engine 图层的**旋转**（HAL 自己就拒，见 §6.5），以及
+`AHB_CTRL.DESTINATION = LCD`（只做写内存）。VL 的旋转和缩放、co-engine 图层的
+**缩放**都**不在**这一类了，见 §7.7。
 
 **遇到这些也照常完成**是刻意的：作业用了它们，固件就在等它，卡死比画错更难
 查。L1/L2 在这颗芯片上不存在（HAL 为 `SF32LB52X` 定义 `EPIC_L2_L1_INVALID`，
@@ -655,7 +659,82 @@ HAL 的写法（`bf0_hal_epic.c:1897`、`:4025`）是：
 把位流当像素画。模型从 EZIP 设备的 link（属性 `ezip`，机器接的）取帧，几何和
 alpha 的规矩见 §6.5；没有帧可用时记一笔并跳过该层。
 
-只有 `CH_SEL` 指到的那一层吃 co-engine，其余照旧读 `SRC`。
+只有 `CH_SEL` 指到的那一层吃 co-engine，其余照旧读 `SRC`。带缩放时这条路和
+普通内存图层共用同一套反算（`epic_vl_transform_apply()`），只是采样点换成帧内
+下标——见 §6.5 和 §7.7。HAL 拒收 co-engine 图层的旋转，所以旋转那条不用担心。
+
+### 7.7 VL 的旋转与缩放（已做）
+
+VL 是 52x 上唯一带变换单元的图层：`VL_ROT`、`VL_ROT_M_CFG1/2/3`、
+`VL_SCALE_RATIO_H/V`、`VL_SCALE_INIT_CFG1/2`、`VL_EXTENTS`、`VL_MISC_CFG` 都是
+它专属的（L0 没有这套，L1/L2 在 52x 不存在）。HAL 在 CPU 上把正变换算完，把
+结果当寄存器留给硬件（`bf0_hal_epic.c:2506-2966` 算、`:3145-3250` 写）；硬件
+反过来按输出像素逐个反算源坐标。模型做的是同一件事。
+
+**读题。** 这些寄存器一旦不表示"原样"，VL 图层就走变换那条路：
+
+| 寄存器 | 意思 |
+|---|---|
+| `ROT.DEG_FORCE` / `ROT_DEG` / `ROT_M_CFG1.M_MODE` | 有旋转 |
+| `SCALE_RATIO_H/V` ≠ `0x10000`、`SCALE_INIT_CFG1/2` ≠ 0 | 有缩放 |
+
+三者都不成立时走原来的矩形快路径，逐字节结果不变——[8]/[8b] 和 `example/hal/epic`
+那四个采样点钉的就是这条。
+
+**反算。** 对画布上属于该图层的像素（相对左上角偏移 `l`）：
+
+```
+r        = (SCALE_INIT + l * SCALE_RATIO) >> 16          // 未旋转的源坐标
+source   = R(-ROT_DEG) * (r - PIVOT) + PIVOT - SRC_TL    // 有旋转时
+```
+
+`r` 的表达式不是猜的：`EPIC_CalcDecImgArea()`（`bf0_hal_epic.c:3755`）给
+co-engine 算窗口起点时用的就是 `(start_col * scale_x + scale_init_x) >> 16`，
+`start_col` 正是像素相对图层 `TL_POS` 的偏移。旋转那一步是 HAL 正变换
+（`TRANSFORM_POINT`，`bf0_hal_epic.c:1301`）的逆：源点 `u` 落画布
+`TL + (R(θ)·(u + SRC_TL - PIVOT) + PIVOT) / 缩放`。`ROT_M_CFG2` 是 pivot、
+`ROT_M_CFG3` 是旋转前的源图左上角，都以图层左上角为原点、11 位有符号
+（52x 起才有符号，55x 的正寄存器容不下负值，HAL 为此加了 `d2/d3` 平移，
+`bf0_hal_epic.c:2627-2680`）。
+
+**角度与 sin/cos。** `ROT_DEG` 的单位是**整度**：HAL 的输入是 0.1 度，它先除以
+10 再下发，遇到恰好 0/90/180/270 会 +1 让象限确定（`bf0_hal_epic.c:2551`）。
+HAL 还把 `|sin|`/`|cos|` 强行放进 `VL_MISC_CFG` 的 `SIN_FORCE_VALUE`/
+`COS_FORCE_VALUE`（Q1.12，即 HAL 里 Q1.15 表右移 3 位，`EPIC_SIN_COS_FRAC_BIT`
+与 `EPIC_VL_MISC_CFG_SIN_FRAC_BIT` 之差），符号由 `ROT_DEG` 的象限给。模型照
+这个读；只有 `DEG_FORCE` 没置时才退回去按角度现算。
+
+**采样是最近邻。** `VL_FILTER`/`CFG.FILTER_EN` 不是插值开关：那个 FILTER 寄存器
+装的是 R/G/B，HAL 用它给 A8/L8 源替换颜色（`bf0_hal_epic.c:3128`），寄存器图里
+没有任何选插值核的位。源坐标直接截断（`>> 16`），不四舍五入。
+
+**源外怎么办。** 只画 `EXTENTS` 框住的那块源区——它就是 HAL 裁好的
+`clip_area`，也是它交给 co-engine 的窗口边界（`bf0_hal_epic.c:3145`、
+`:3755`）。反算落在框外的输出像素原样留下，不取样、不混。
+
+**co-engine 图层走同一套反算。** `COENG_CFG` 把某层的输入换成 EZIP 解码帧时
+（§6.5/§7.6），若该层带缩放，反算不变，只是把"在 `SRC` 里按 `(sx, sy)` 取样"
+换成"取帧内 `(sx - start_col, sy - start_row)`"。帧本身就是 HAL 按同一份
+`clip_area` 裁出来的窗口（`EPIC_CalcDecImgArea()`，`bf0_hal_epic.c:3696-3790`），
+所以帧边界就是读取的边界，落在帧外的输出像素不画。旋转对 co-engine 图层不可达
+（HAL 入口就拒，`bf0_hal_epic.c:6200`）：真遇到带角度的寄存器组，模型记一笔并
+按未变换画，不猜。
+
+**SCALE_RATIO 为 0 算"没缩放"。** HAL 给不缩放的图层写的永远是
+`EPIC_SCALE_1`（`bf0_hal_epic.c:3375-3379`，`EPIC_ContResetVideoLayer` 也一样，
+`:3479-3483`），从不下发 0。按变换读 0 会把整个矩形塌到一个源像素上，所以模型把
+0 当作"没有缩放"——[9b] 那段手写的寄存器组正是这种情况。
+
+**验证。** `notes/qtest-sifli.sh` 的 [8c] 各跑一次 90° 旋转和 2× 放大，期望像素
+手工可推（见那节的注释）；[9b] 钉 co-engine 的未变换那条，[9d] 在同一个窗口上
+加一条横向 2× 钉带缩放的 co-engine 那条。真机固件那一侧现在
+有了 co-engine 缩放的样本：`example/rt_device/gpu/single_mode` 的
+`scale_down_demo()` 依次跑 `multiple = 1/2/3`（`src/main.c:534-552`），模型把
+`buffer0` 抓出来、宿主解码同一份资产逐像素比对——1× 与改动前逐字节相同，2×/3×
+与寄存器反算的采样完全一致（跑法见 `notes/build-and-verify.md`）。旋转仍没有
+可比对样本：SDK 里真做旋转的例程（`single_mode` 的旋转+mask、LVGL 那条
+`lv_draw_epic_img.c` → `HAL_EPIC_Adv`）只把结果打到 LCD 上，既不打印校验和也不
+比期望像素，`docs/source/en/hal/epic.md` 也没有逐像素算法的描述。
 
 ---
 
@@ -1081,18 +1160,23 @@ grep -n "while\s*(" drivers/hal/bf0_hal_xxx.c
 
 ### 13.1 模型缺口
 
-**co-engine 图层带缩放或旋转仍不画。** §7.5 那一类（缩放和旋转对所有图层都不
-实现）叠上 EZIP 通道，正好是 `example/rt_device/gpu/single_mode` 的 EZIP demo：
-`src/main.c:186` 设 `EPIC_INPUT_EZIP`，`:180` 和 `:197-198` 又设
-`scale_x/scale_y = 1024 * multiple`。所以那个工程在模型上看不到正确结果。它是
-现成唯一的"EZIP 图层 + 缩放"样本，要动这块就拿它当验收。
+**co-engine 图层的缩放已做，旋转仍未做。** HAL 对 EZIP 图层有两条专属限制，
+都在 `HAL_EPIC_BlendStartEx` 的入口（`bf0_hal_epic.c:6196-6204`）：**不能旋转**
+（`rot_cfg->angle != 0` 直接 `RETURN_ERROR`，注释写着 `don't support ezip
+rotation`），以及**两个 EZIP 图层不能一前一后同框**。缩放**不在**拒绝之列——
+它和别的图层一样走比例通道（`bf0_hal_epic.c:2831` 那段的 `scale_x/scale_y`）。
+缩放那条模型已经跟上了（§7.7），并用 `example/rt_device/gpu/single_mode` 的
+`scale_down_demo(1/2/3)` 做了逐像素验收；旋转对 co-engine 图层不可达，模型不
+实现，真遇到只记一笔并按未变换画。
 
-HAL 自己对 EZIP 图层有两条专属限制，都在 `HAL_EPIC_BlendStartEx` 的入口
-（`bf0_hal_epic.c:6194-6203`）：**不能旋转**（`rot_cfg->angle != 0` 直接
-`RETURN_ERROR`，注释写着 `don't support ezip rotation`），以及**两个 EZIP 图层
-不能一前一后同框**。缩放**不在**拒绝之列——它和别的图层一样走比例通道
-（`bf0_hal_epic.c:2831` 那段的 `scale_x/scale_y`），所以 `single_mode` 那个
-"EZIP + 缩放"的 demo 在真机上合法，只是模型画不出来（§7.5）。
+**旋转仍没有真机可比对的样本。** §7.7 的旋转反算只由 [8c] 的手推像素钉住。SDK 里
+真做旋转的例程（`example/get-started/dualcore` 的 rotation3d、LVGL 那条
+`lv_draw_epic_img.c` → `HAL_EPIC_Adv`、`single_mode` 的 `rotate_and_mask_demo()`）
+都只把结果打到 LCD 上，既不打印校验和也不比期望像素。缩放那条不同：`single_mode`
+的 `scale_down_demo()` 画完把结果留在 `buffer0` 里，抓出来就能逐像素比（§7.7）。
+`hal_example` 的两个 EPIC 用例虽然比期望数据，但它们调 `HAL_EPIC_Rotate` 时
+`angle`/`scale` 全是默认值（源码注释就写着 "no rotation and scaling"），验的其实
+是 EZIP 解码。
 
 **I2C（I2C1–4，`0x5009c000` 起，见 `drivers/cmsis/sf32lb52x/register.h:387`）
 没有模型**，板子上的触摸屏因此用不了。现在会干净地超时失败，不挂住系统。
