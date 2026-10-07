@@ -954,13 +954,26 @@ NV3041A、SH8603B、SPD2012、FT2308…）。两种情况下"面板返回自己�
 ## 10. I2C、GPIO 与触控
 
 CO5300 面板的触控是这条链：**I2C1 → FT6146 → PA31 → GPIO1 → NVIC**。三个模型
-拼出来——`hw/i2c/sifli-i2c.c`（控制器）、`hw/i2c/sifli-ft6146.c`（从机）、
-`hw/misc/sifli-gpio.c`（中断脚）——机器里接起来的线是板级的，不是 SoC 的。
+拼出来——`hw/i2c/sifli-i2c.c`（控制器）、`hw/input/ft6146.c`（从机）、
+`hw/misc/sifli-gpio.c`（中断脚）——**机器里一行接线都没有**，整条链是命令行上
+拼的：
+
+```
+-device ft6146,id=touch,bus=i2c1,irqchip=gpio1,irq-pin=31
+```
+
+哪条总线、哪个管脚、用哪颗芯片全是板子的事，所以它们都是属性，不是
+machine 的常量（§10.4）。换一颗触控芯片就是换一个 `-device`，换一条总线
+就是换 `bus=`。
 
 ### 10.1 控制器：SR 和 IER 共用位号
 
 四个控制器 I2C1–4，基址和中断号在 `sf32lb52x_i2cs[]`
-（`hw/arm/sf32lb52x-periph.c`）。
+（`hw/arm/sf32lb52x-periph.c`）。每个控制器的总线由 `bus-name` 属性命名
+（机器依次给 `i2c1`…`i2c4`），**这条命名是 `-device ...,bus=` 能不能用的前提**：
+QEMU 按名字找总线，四条都叫 `i2c` 的话只有第一条够得着，`bus=i2c2` 直接
+`Bus 'i2c2' not found`。不给 `bus-name` 时 QEMU 自己的默认是按创建顺序编号的
+`i2c-bus.0`、`i2c-bus.1`…，那串数字和"第几个控制器"没有对应关系。
 
 HAL 是中断状态机：`SR` 里的一位配上 `IER` 里的同一位就是一次中断，所以两套
 位号是重合的（`drivers/cmsis/Include/i2c.h`），`HAL_I2C_IRQHandler` 读 `SR`、
@@ -1023,35 +1036,54 @@ HAL 几乎不直接写 `DIR`/`DOR`。它写**别名**：`DOESR`/`DOECR` 管输�
 
 ### 10.4 板级接线与验收
 
-**I2C1 和 PA31 是板子的事，不是 SoC 的事**：a128r16 在 `bsp_pinmux.c` 里
-`HAL_PIN_Set(PAD_PA31, GPIO_A31, ...)`，触摸驱动的 `TOUCH_IRQ_PIN` 也是 31。
-所以接在 machine 里，不走命令行——不接的话 SDK 的触摸例程根本跑不起来，接了
-的话不碰 I2C1 的固件一点影响都没有。
+**I2C1 和 PA31 是板子的事，不是 SoC 的事**：a128r16 自己没有 pinmux，它的
+`SConscript`/`Kconfig.board` 把 `sf32lb52-lcd_base` 拉进来，那里面
+`bsp_pinmux.c:213-216` 写的是 `PAD_PA09 → GPIO_A9`（CTP_RESET）、
+`PAD_PA31 → GPIO_A31`（CTP_INT）、`PAD_PA30 → I2C1_SCL`、`PAD_PA33 → I2C1_SDA`；
+触摸驱动的 `TOUCH_IRQ_PIN` 默认也是 31。
+
+**这些都不在 machine 里。** 芯片挂哪条总线靠 `bus=`；中断线靠两个属性，
+因为**命令行没法把两个器件的 GPIO 线连起来**——`qdev_connect_gpio_out()` 是
+C 接口，`-device` 里没有对应写法。所以芯片自己在 realize 里接（照抄
+`hw/riscv/riscv-iommu-sys.c` 的 `irqchip` + `base-irq`）：
+
+| 属性 | 作用 |
+| --- | --- |
+| `bus` | 挂在哪条控制器上，`i2c1`…`i2c4` |
+| `address` | 7 位从机地址，默认 `0x38` |
+| `irqchip` | 中断线的落点，link 到 GPIO 控制器（`gpio1`，或全路径 `/machine/gpio1`） |
+| `irq-pin` | 落点里的第几根脚 |
+
+`irqchip` 不写就悬空——没接中断线的板子可以什么都不给。写错的名字是正常报错
+（`Device 'nosuchchip' not found`），不是 assert。
 
 验收跑的是 `sf32lb52-lcd_a128r16_hcpu` 的 `example/rt_driver`，SDK 原样构建、
-一行不改，手指从 QMP 的 `qom-set` 注入：
+一行不改，手指从 QMP 的 `qom-set` 注入（芯片给了 `id=touch`，所以路径是
+`/machine/peripheral/touch`）：
 
 ```
 I/TOUCH tp_init: touch screen found driver  2000a7c8, ft6146
 E/drv.ft6146 tp_init: ft6146 id_H=0
 E/drv.ft6146 tp_init: ft6146 id_L=0
 Touch down [120,200]
+Touch up   [120,200]
 Touch down [300,200]
 Touch down [300,400]
 Touch up   [300,400]
 ```
 
-注入的是三步（按下 → 移到别处 → 抬起），出来却是四次上报。多出来的那个
-`[300,200]` 不是模型乱报：x 和 y 是两个 QOM 属性，一次只能写一个，而**手指按着
-的时候每写一次就重发一次当前点**（`touch-x`/`touch-y` 在 `touch_down` 为真时报，
-`touch-down` 自己每次都报），所以先写 x 的那一瞬间，报的是新 x 配旧 y。真机上一
-根手指扫过去本来也会连出一串点，驱动只认最新的那个——只是别把这一条当成
-"注入了几次就该有几行"。
+注入的是三步（按下 → 移到别处 → 抬起），出来是五次上报，两次都是有原因的：
+`[300,200]` 是 x 和 y 分两个 QOM 属性写，一次只能写一个，而**手指按着的时候每写
+一次就重发一次当前点**（`touch-x`/`touch-y` 在 `touch_down` 为真时报，`touch-down`
+自己每次都报），所以先写 x 的那一瞬间报的是新 x 配旧 y；第二行那个
+`Touch up [120,200]` 是下面那个看门狗合成的。真机上一根手指扫过去本来也会连出
+一串点，驱动只认最新的那个——别把这一条当成"注入了几次就该有几行"。
 
 > **注入之间别停太久。** 驱动有个 200 ms 的卡点看门狗
 > （`ft6146_check_timer_handler`，100 ms 周期，连着两次没收到新点就
 > `abnormal_recovery`），它会在最后一次坐标上自己合成一个 **UP**。dwell 超过
-> 200 ms 就会多出一行 `Touch up`——那是驱动干的，不是模型。
+> 200 ms 就会多出一行 `Touch up`——上面日志的第二行就是这么来的（注入脚本两步
+> 之间停 2 s），是驱动干的，不是模型。把 dwell 压到 200 ms 以内它就没了。
 
 不用固件也能验：`qtest-sifli.sh` 第 [17] 段把这条链从总线一路走到 NVIC 逐环钉死
 （PA31 空闲高、下降沿锁存、W1C 清位、主机没读走之前不再产生边沿、读走后松开、
