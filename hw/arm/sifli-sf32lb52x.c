@@ -523,7 +523,7 @@ static void sifli_sf32lb52x_init(MachineState *machine)
     /*
      * The LCD controller. Its panel is not built here: a panel is a part of
      * the board rather than of the SoC, so it is whatever "-device
-     * sifli-panel" the user passed, and it attaches itself to this device's
+     * sifli-lcd-panel" the user passed, and it attaches itself to this device's
      * QSPI bus when it realizes. Without one the controller still runs and
      * still draws, sized from the layer's own rectangle, but the panel ID
      * read comes back zero and the firmware will not recognise the screen.

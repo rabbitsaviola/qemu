@@ -39,7 +39,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/display/sifli-lcdc.h"
-#include "hw/display/sifli-panel.h"
+#include "hw/display/sifli-lcd-panel.h"
 #include "hw/irq.h"
 #include "hw/misc/sifli-sbus.h"
 #include "hw/qdev-properties.h"
@@ -188,14 +188,14 @@ static void sifli_lcdc_write_single(SifliLcdcState *s, uint32_t v)
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "%s: firmware is reading panel register 0x%02x "
                               "but no panel is attached; pass "
-                              "-device sifli-panel\n",
+                              "-device sifli-lcd-panel\n",
                               TYPE_SIFLI_LCDC, sifli_lcdc_cmd_reg(s->cmd_word));
             }
             s->rd_data = 0;
             return;
         }
 
-        s->rd_data = sifli_panel_read_reg(SIFLI_PANEL(s->panel_dev),
+        s->rd_data = sifli_lcd_panel_read_reg(SIFLI_LCD_PANEL(s->panel_dev),
                                           sifli_lcdc_cmd_reg(s->cmd_word), len);
     }
 }
@@ -514,7 +514,7 @@ static const GraphicHwOps sifli_lcdc_gfx_ops = {
 
 void sifli_lcdc_set_panel(SifliLcdcState *s, DeviceState *panel)
 {
-    SifliPanelState *p = SIFLI_PANEL(panel);
+    SifliLcdPanelState *p = SIFLI_LCD_PANEL(panel);
 
     s->panel_dev = panel;
 
@@ -553,7 +553,7 @@ static void sifli_lcdc_init(Object *obj)
                           TYPE_SIFLI_LCDC, SIFLI_LCDC_MMIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 
-    /* The panel attaches here; a bare -device sifli-panel finds it. */
+    /* The panel attaches here; a bare -device sifli-lcd-panel finds it. */
     s->qspi = qbus_new(TYPE_SIFLI_QSPI_BUS, DEVICE(obj), "qspi");
 }
 

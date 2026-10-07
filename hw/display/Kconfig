@@ -160,5 +160,5 @@ config SIFLI_LCDC
     bool
     depends on PIXMAN
 
-config SIFLI_PANEL
+config SIFLI_LCD_PANEL
     bool

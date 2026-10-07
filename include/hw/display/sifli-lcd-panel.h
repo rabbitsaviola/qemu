@@ -1,5 +1,5 @@
 /*
- * SiFli QSPI panel
+ * SiFli LCD panel
  *
  * A board's LCD module is a separate part from the SoC, and different boards
  * fit different ones. The only thing firmware asks a panel is "which one are
@@ -9,23 +9,29 @@
  * resolution, the initialisation sequence, the GRAM -- either belongs to the
  * controller or is not observable.
  *
- *   -device sifli-panel                                  (CO5300, 390x450)
- *   -device sifli-panel,id=0x60834200,width=480,height=272
+ * The modules differ only in what they answer, so which one this is comes in
+ * as properties. The defaults are the a128r16 board's CO5300 module:
+ *
+ *   -device sifli-lcd-panel
+ *   -device sifli-lcd-panel,id=0x60834200,width=480,height=272
  *
  * A panel attaches to the QSPI bus the LCDC publishes, so plain
- * "-device sifli-panel" finds it without a bus= argument.
+ * "-device sifli-lcd-panel" finds it without a bus= argument.
+ *
+ * The name says what it is rather than which chip it is, so that it reads as
+ * the other half of the LCDC and not as the touch controller's panel.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#ifndef HW_DISPLAY_SIFLI_PANEL_H
-#define HW_DISPLAY_SIFLI_PANEL_H
+#ifndef HW_DISPLAY_SIFLI_LCD_PANEL_H
+#define HW_DISPLAY_SIFLI_LCD_PANEL_H
 
 #include "hw/qdev-core.h"
 #include "qom/object.h"
 
-#define TYPE_SIFLI_PANEL "sifli-panel"
-OBJECT_DECLARE_SIMPLE_TYPE(SifliPanelState, SIFLI_PANEL)
+#define TYPE_SIFLI_LCD_PANEL "sifli-lcd-panel"
+OBJECT_DECLARE_SIMPLE_TYPE(SifliLcdPanelState, SIFLI_LCD_PANEL)
 
 /*
  * The bus the panel hangs on. It carries no protocol: the controller and the
@@ -39,7 +45,7 @@ struct SifliQspiBus {
     BusState qbus;
 };
 
-struct SifliPanelState {
+struct SifliLcdPanelState {
     DeviceState parent_obj;
 
     /*
@@ -58,6 +64,7 @@ struct SifliPanelState {
  * on the bus; the controller decides how many of its bytes the driver asked
  * for.
  */
-uint32_t sifli_panel_read_reg(SifliPanelState *s, unsigned reg, unsigned len);
+uint32_t sifli_lcd_panel_read_reg(SifliLcdPanelState *s, unsigned reg,
+                                  unsigned len);
 
-#endif /* HW_DISPLAY_SIFLI_PANEL_H */
+#endif /* HW_DISPLAY_SIFLI_LCD_PANEL_H */

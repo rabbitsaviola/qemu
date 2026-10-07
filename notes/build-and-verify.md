@@ -313,7 +313,7 @@ arm-none-eabi-nm -S <SDK>/example/rt_device/gpu/single_mode/project/build_sf32lb
 
 ```bash
 timeout 300 ~/build-sifli/qemu-system-arm -M sf32lb52x,ezip-tool=<SDK>/tools/png2ezip/ezip_linux \
-  -device sifli-panel -display none \
+  -device sifli-lcd-panel -display none \
   -serial file:/tmp/scale.log \
   -monitor unix:/tmp/scale-mon.sock,server,nowait \
   -gdb tcp::45505 -S \
@@ -438,11 +438,11 @@ tick 修好之前 45 秒只出一帧。
 
 ### ③ 看画面
 
-**必须带 `-device sifli-panel`**，否则 LCDC 不知道该画多大、驱动也认不出屏
+**必须带 `-device sifli-lcd-panel`**，否则 LCDC 不知道该画多大、驱动也认不出屏
 （固件打 `unknow lcd!`，屏幕黑但不崩）：
 
 ```bash
-~/build-sifli/qemu-system-arm -M sf32lb52x -device sifli-panel -display sdl \
+~/build-sifli/qemu-system-arm -M sf32lb52x -device sifli-lcd-panel -display sdl \
     -serial stdio \
     -kernel <SDK>/example/rt_driver/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
 ```
@@ -450,7 +450,7 @@ tick 修好之前 45 秒只出一帧。
 WSL 里 `DISPLAY=:0` 由 WSLg 提供，不用额外配置。换屏是换命令行，不改 QEMU：
 
 ```bash
--device sifli-panel,id=0x60834200,width=480,height=272
+-device sifli-lcd-panel,id=0x60834200,width=480,height=272
 ```
 
 #### hal/epic 也送屏，而且走的是另一条路
@@ -464,7 +464,7 @@ LCD task 的消息队列塞一条 `LCD_MSG_DRAW_RECT_ASYNC`（`drv_lcd.c:1824`�
 cd <SDK>/example/hal/epic/project
 scons --board=sf32lb52-lcd_a128r16_hcpu -j8
 
-~/build-sifli/qemu-system-arm -M sf32lb52x -device sifli-panel -display sdl \
+~/build-sifli/qemu-system-arm -M sf32lb52x -device sifli-lcd-panel -display sdl \
     -serial stdio \
     -kernel <SDK>/example/hal/epic/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
 ```
@@ -638,7 +638,7 @@ bash notes/realboard/run.sh
 
 ```
 □ 两个二进制的 -M help 都能看到 sf32lb52x
-□ -device sifli-panel 下 screendump 的 PPM 里那块颜色是对的
+□ -device sifli-lcd-panel 下 screendump 的 PPM 里那块颜色是对的
 □ 真实板子固件能跑出 "Hello world!" 和 msh 提示符（不带 -semihosting）
 □ ezip 例程四句 [EZIP]Output is correct.
 □ epic 例程打 "EPIC blend succeeded"

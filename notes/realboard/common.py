@@ -522,7 +522,7 @@ class QemuSession:
                 os.remove(p)
         cmd = [self.qemu,
                "-M", "sf32lb52x,ezip-tool=%s" % self.ezip_tool,
-               "-device", "sifli-panel", "-display", "none",
+               "-device", "sifli-lcd-panel", "-display", "none",
                "-serial", "file:%s" % self.serial,
                "-monitor", "unix:%s,server,nowait" % self.monsock,
                "-gdb", "tcp::%d" % self.port, "-S",

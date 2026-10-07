@@ -54,7 +54,7 @@ run() {
 run_panel() {
     printf '%s\n' "$@" quit \
         | timeout 30 "$QEMU" -M sf32lb52x -display none -accel qtest \
-              -serial none -device sifli-panel -qtest stdio 2>/dev/null | tr -d '\r'
+              -serial none -device sifli-lcd-panel -qtest stdio 2>/dev/null | tr -d '\r'
 }
 
 # 要用 clock_step 推时基的那几项走这一条，必须显式 -accel qtest。
@@ -730,7 +730,7 @@ check 0x10001 "START 后 IRQ 置 EOF_STAT|EOF_RAW"
 check 0x0     "写 1 清后 IRQ 读回 0"
 
 echo
-echo "[12] LCDC：忘了 -device sifli-panel 时不崩，只是读回 0"
+echo "[12] LCDC：忘了 -device sifli-lcd-panel 时不崩，只是读回 0"
 out=$(run \
     'writel 0x5000809c 0x00000000' \
     'writel 0x5000809c 0x00c00000' \

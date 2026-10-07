@@ -17,7 +17,7 @@ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
 system_ss.add(when: 'CONFIG_SIFLI_EPIC', if_true: files('sifli-epic.c'))
 system_ss.add(when: 'CONFIG_SIFLI_EZIP', if_true: [files('sifli-ezip.c'), zlib])
 system_ss.add(when: 'CONFIG_SIFLI_LCDC', if_true: files('sifli-lcdc.c'))
-system_ss.add(when: 'CONFIG_SIFLI_PANEL', if_true: files('sifli-panel.c'))
+system_ss.add(when: 'CONFIG_SIFLI_LCD_PANEL', if_true: files('sifli-lcd-panel.c'))
 system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
 
 system_ss.add(when: 'CONFIG_VGA_PCI', if_true: files('vga-pci.c'))

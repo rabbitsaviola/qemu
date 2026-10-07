@@ -10,7 +10,7 @@
  * model. That also means the model has to be the one to read the framebuffer.
  *
  * The panel hanging off the controller's QSPI bus is a separate device
- * (-device sifli-panel), not part of this one; see sifli-panel.h.
+ * (-device sifli-lcd-panel), not part of this one; see sifli-lcd-panel.h.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

@@ -817,7 +817,7 @@ RGB565），加 PSRAM 就是为了让它们能跑。
 ## 9. LCDC 与面板（显示）
 
 `hw/display/sifli-lcdc.c`（控制器，machine 建，`0x50008000` / IRQ 63）+
-`hw/display/sifli-panel.c`（面板，`-device`）。画面直接进 QEMU 的显示控制台，
+`hw/display/sifli-lcd-panel.c`（面板，`-device`）。画面直接进 QEMU 的显示控制台，
 `-display sdl` 就是屏幕。
 
 ### 9.1 两条互不相干的路径
@@ -896,9 +896,19 @@ IRQ.EOF → HAL_LCDC_IRQHandler → LCDC_TransCpltCallback → SendLayerDataCplt
 "换命令行就能换屏"了：
 
 ```bash
--device sifli-panel                                   # 默认就是 a128r16 的 CO5300
--device sifli-panel,id=0x60834200,width=480,height=272
+-device sifli-lcd-panel                                   # 默认就是 a128r16 的 CO5300
+-device sifli-lcd-panel,id=0x60834200,width=480,height=272
 ```
+
+**名字说的是"什么"，不是"哪颗芯片"。** SDK 里躺着十几个面板驱动（co5300 /
+co5300_dual / sh8601 / sh8601a / st7789h2 / st7789v / ft2308…），但它们落到这个
+模型上的差别只有三样：ID 值、ID 在哪个寄存器、屏多大。`ft2308` 的 ID 寄存器在
+`0x0400` 而非 `0x04`，各家的 ID 值互不相同（a128r16 这颗 CO5300 是 `0x331100`，
+别的板子那颗是 `0x530001`），`sh8601` 的驱动压根不作读——它直接返回常量，因为
+那块屏没有可读的 ID。所以按芯片分设备只是把同一段代码抄十几遍，**做成属性就够**。
+
+这么叫还顺带把两个 "panel" 分开了：`sifli-lcd-panel` 跟 `sifli-lcdc` 成对，
+不至于和 `hw/input/touch-panel.c` 那个触控的 panel 看混。
 
 **面板比 LCDC 晚 realize，所以只能由面板反向注册。** `-device` 的处理在
 `machine_run_board_init()` **之后**（`system/vl.c:2751` vs `:2716`），LCDC 在
@@ -907,7 +917,7 @@ IRQ.EOF → HAL_LCDC_IRQHandler → LCDC_TransCpltCallback → SendLayerDataCplt
 
 **分辨率只能由面板给**：`LCD_CONF` 只有格式/接口字段、没有分辨率；
 `CANVAS_TL/BR_POS` 写的是刷新脏矩形，不是屏的物理尺寸。忘了 `-device` 的话
-模型打 `LOG_GUEST_ERROR`（带 "pass -device sifli-panel"），固件自己也会打
+模型打 `LOG_GUEST_ERROR`（带 "pass -device sifli-lcd-panel"），固件自己也会打
 `unknow lcd!`，屏幕黑但不崩——两条都值得留痕。
 
 面板侧**不建模 QSPI 协议、不建模命令序列、不建模面板 GRAM**：初始化的那一长串

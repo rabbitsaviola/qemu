@@ -74,8 +74,8 @@ hw/misc/sifli-regbank.c
 include/hw/misc/sifli-regbank.h
 hw/display/sifli-lcdc.c
 include/hw/display/sifli-lcdc.h
-hw/display/sifli-panel.c
-include/hw/display/sifli-panel.h
+hw/display/sifli-lcd-panel.c
+include/hw/display/sifli-lcd-panel.h
 hw/i2c/sifli-i2c.c
 include/hw/i2c/sifli-i2c.h
 hw/input/touch-panel.c
@@ -302,7 +302,7 @@ else
     # 寄存器写和截图，不需要客户机执行任何指令。
     exec 3<>"$fifo"
     timeout 60 "$BUILD/qemu-system-arm" -M sf32lb52x \
-        -display none -serial none -device sifli-panel -S \
+        -display none -serial none -device sifli-lcd-panel -S \
         -qtest stdio -monitor unix:$sock,server=on,wait=off \
         < "$fifo" > "$log" 2>&1 &
     qpid=$!
