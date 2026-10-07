@@ -113,8 +113,11 @@ config SIFLI_SF32LB52X
     select SIFLI_LCDC
     select SIFLI_PANEL
     select SIFLI_I2C
-    select SIFLI_FT6146
     select SIFLI_GPIO
+    # The board's I2C slaves -- a touch controller among them -- are -device
+    # only, so the SoC ships the group of user-pluggable devices rather than
+    # naming any particular one.
+    imply I2C_DEVICES
 
 config MPS3R
     bool

@@ -1,9 +1,23 @@
 /*
  * FocalTech FT6146 capacitive touch controller
  *
- * The chip the a128r16 board's panel carries, as an I2C slave at 7-bit
- * address 0x38. It answers the register reads the SDK driver makes and drives
- * one interrupt line low while a touch is waiting to be read.
+ * The touch controller several of the SiFli panels carry, as an I2C slave at
+ * 7-bit address 0x38 by default. It answers the register reads the SDK driver
+ * makes and drives one interrupt line low while a touch is waiting to be
+ * read.
+ *
+ * Nothing here is SoC-specific: the device is an ordinary I2C slave, so any
+ * machine can hang it off a bus with -device, and the address is whichever
+ * the "address" property says. Which bus it goes on and where its interrupt
+ * line is wired are the board's business, not the chip's, and both are
+ * therefore properties:
+ *
+ *   -device ft6146,bus=i2c2,irqchip=gpio1,irq-pin=31
+ *
+ * QEMU's command line cannot connect a GPIO line itself, so the device does
+ * it: "irqchip" names the controller its interrupt line reaches and "irq-pin"
+ * which line of it. With no irqchip the interrupt goes nowhere, which is what
+ * a board that leaves the pin unrouted wants.
  *
  * The register map below is only as large as the driver uses; see
  * customer/peripherals/touch_panel/ft6146/ft6146.c in the SDK.
@@ -11,32 +25,32 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#ifndef HW_I2C_SIFLI_FT6146_H
-#define HW_I2C_SIFLI_FT6146_H
+#ifndef HW_INPUT_FT6146_H
+#define HW_INPUT_FT6146_H
 
 #include "hw/i2c/i2c.h"
 #include "hw/irq.h"
 #include "qom/object.h"
 
-#define TYPE_SIFLI_FT6146 "sifli-ft6146"
-OBJECT_DECLARE_SIMPLE_TYPE(SifliFt6146State, SIFLI_FT6146)
+#define TYPE_FT6146 "ft6146"
+OBJECT_DECLARE_SIMPLE_TYPE(Ft6146State, FT6146)
 
 /* 7-bit address. The driver calls it FT_DEV_ADDR. */
-#define SIFLI_FT6146_ADDR           0x38
+#define FT6146_ADDR           0x38
 
 /* Registers the driver names; the rest of the space is answered with zero. */
-#define SIFLI_FT6146_TD_STATUS      0x02    /* number of points, low nibble */
-#define SIFLI_FT6146_P1_XH          0x03    /* event flag, then x[11:8] */
-#define SIFLI_FT6146_P1_XL          0x04
-#define SIFLI_FT6146_P1_YH          0x05    /* point id, then y[11:8] */
-#define SIFLI_FT6146_P1_YL          0x06
-#define SIFLI_FT6146_ID_L           0x9f
-#define SIFLI_FT6146_ID_H           0xa3
+#define FT6146_TD_STATUS      0x02    /* number of points, low nibble */
+#define FT6146_P1_XH          0x03    /* event flag, then x[11:8] */
+#define FT6146_P1_XL          0x04
+#define FT6146_P1_YH          0x05    /* point id, then y[11:8] */
+#define FT6146_P1_YL          0x06
+#define FT6146_ID_L           0x9f
+#define FT6146_ID_H           0xa3
 
 /* P1_XH bits 7:6. The SDK driver calls these ctp_pen_state_enum. */
-#define SIFLI_FT6146_EVENT_DOWN     0
-#define SIFLI_FT6146_EVENT_UP       1
-#define SIFLI_FT6146_EVENT_MOVE     2
+#define FT6146_EVENT_DOWN     0
+#define FT6146_EVENT_UP       1
+#define FT6146_EVENT_MOVE     2
 
 /*
  * Coordinate range of the panel this controller is bonded to, the driver's
@@ -49,15 +63,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SifliFt6146State, SIFLI_FT6146)
  * the controller reports them. A test injecting a point should expect that
  * point back, not its mirror.
  */
-#define SIFLI_FT6146_MAX_X          390
-#define SIFLI_FT6146_MAX_Y          450
+#define FT6146_MAX_X          390
+#define FT6146_MAX_Y          450
 
-#define SIFLI_FT6146_NREGS          0x100
+#define FT6146_NREGS          0x100
 
-struct SifliFt6146State {
+struct Ft6146State {
     I2CSlave parent_obj;
 
-    uint8_t regs[SIFLI_FT6146_NREGS];
+    uint8_t regs[FT6146_NREGS];
 
     /* Where the next byte read comes from. */
     uint8_t ptr;
@@ -79,6 +93,13 @@ struct SifliFt6146State {
     qemu_irq int_line;
     bool int_asserted;
 
+    /*
+     * Where that line goes. Both are board wiring, so both are properties;
+     * realize connects the line when irqchip is set. See the file comment.
+     */
+    DeviceState *irqchip;
+    uint32_t irq_pin;
+
     /* Last injected touch. Written through the touch-* properties. */
     uint32_t touch_x;
     uint32_t touch_y;
@@ -89,4 +110,4 @@ struct SifliFt6146State {
     uint32_t id_l;
 };
 
-#endif /* HW_I2C_SIFLI_FT6146_H */
+#endif /* HW_INPUT_FT6146_H */

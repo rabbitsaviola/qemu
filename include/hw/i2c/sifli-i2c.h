@@ -62,8 +62,10 @@ enum {
 #define SIFLI_I2C_TCR_STOP      BIT(2)
 #define SIFLI_I2C_TCR_NACK      BIT(3)      /* NACK the byte just received */
 
-/* SR and IER share bit positions, which is what makes the interrupt test a
- * plain mask. SR bits 0-3 (RWM, NACK, UB, IBB) have no IER counterpart. */
+/*
+ * SR and IER share bit positions, which is what makes the interrupt test a
+ * plain mask. SR bits 0-3 (RWM, NACK, UB, IBB) have no IER counterpart.
+ */
 #define SIFLI_I2C_SR_NACK       BIT(1)
 #define SIFLI_I2C_SR_UB         BIT(2)      /* unit busy */
 #define SIFLI_I2C_SR_ALD        BIT(5)      /* arbitration lost */
@@ -89,6 +91,13 @@ struct SifliI2CState {
 
     /* The bus the controller masters. Created in realize. */
     I2CBus *bus;
+
+    /*
+     * What that bus is called. QEMU addresses a bus by name, so this is how a
+     * slave picks a controller: -device ft6146,bus=i2c2. The machine names
+     * them after the controllers; unset falls back to the generic "i2c".
+     */
+    char *bus_name;
 
     /* Indexed by the enum above. TCR is write-only and never stored. */
     uint32_t regs[SIFLI_I2C_NREGS];

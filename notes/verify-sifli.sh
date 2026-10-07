@@ -75,7 +75,13 @@ include/hw/misc/sifli-regbank.h
 hw/display/sifli-lcdc.c
 include/hw/display/sifli-lcdc.h
 hw/display/sifli-panel.c
-include/hw/display/sifli-panel.h"
+include/hw/display/sifli-panel.h
+hw/i2c/sifli-i2c.c
+include/hw/i2c/sifli-i2c.h
+hw/input/ft6146.c
+include/hw/input/ft6146.h
+hw/misc/sifli-gpio.c
+include/hw/misc/sifli-gpio.h"
 
 if [ -f "$SRC/scripts/checkpatch.pl" ]; then
     for f in $NEW_FILES; do
@@ -108,6 +114,8 @@ if [ -e "$SRC/.git" ]; then
               hw/char/Kconfig hw/char/meson.build \
               hw/dma/Kconfig hw/dma/meson.build \
               hw/display/Kconfig hw/display/meson.build \
+              hw/i2c/Kconfig hw/i2c/meson.build \
+              hw/input/Kconfig hw/input/meson.build \
               hw/misc/Kconfig hw/misc/meson.build 2>/dev/null \
           | grep 'w/crlf' || true)
     if [ -z "$bad" ]; then

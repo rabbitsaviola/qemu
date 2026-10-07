@@ -137,7 +137,7 @@ class Qmp:
 
     def touch(self, **props):
         for prop, value in props.items():
-            self.cmd("qom-set", path="/machine/touch",
+            self.cmd("qom-set", path="/machine/peripheral/touch",
                      property="touch-" + prop, value=value)
 
 
@@ -175,13 +175,18 @@ def main():
     sock = os.path.join(sockdir, "qmp.sock")
     errlog = os.path.join(sockdir, "stderr")
 
+    # 触控芯片是板子的事，machine 不再建它，所以这里自己挂一个——用的正是
+    # 真机验收那条 -device（bus 选 I2C1，中断接 GPIO1 的 PA31）。id=touch
+    # 只是给 QMP 一个稳定的路径来注入触摸。
+    #
     # -S：开机就停住。这一项不跑固件，CPU 放着自己跑会从地址 0 取指令、
-    # 然后 Lockup 到 HardFault 把 QEMU 整个 abort 掉（`-qtest` 不隐含停机，
-    # 其余几项是因为命令喂完就关 stdin、抢在崩之前跑完）。停了之后 MMIO
-    # 照样读写——qtest 走的是 address_space，不需要 CPU。
+    # 然后 Lockup 到 HardFault 把 QEMU 整个 abort 掉（`-qtest` 不隐含停机）。
+    # 停了之后 MMIO 照样读写——qtest 走的是 address_space，不需要 CPU。
+    # qtest-sifli.sh 里那几段是同一件事，用的是 -accel qtest。
     with open(errlog, "w") as errf:
         proc = subprocess.Popen(
             [QEMU, "-M", "sf32lb52x", "-display", "none", "-serial", "none",
+             "-device", "ft6146,id=touch,bus=i2c1,irqchip=gpio1,irq-pin=31",
              "-S", "-qtest", "stdio",
              "-qmp", "unix:%s,server,nowait" % sock],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,

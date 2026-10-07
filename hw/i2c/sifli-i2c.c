@@ -223,7 +223,14 @@ static void sifli_i2c_realize(DeviceState *dev, Error **errp)
 {
     SifliI2CState *s = SIFLI_I2C(dev);
 
-    s->bus = i2c_init_bus(dev, "i2c");
+    /*
+     * The bus has to carry the controller's name: a slave is attached from
+     * the command line with -device ...,bus=<name>, and QEMU looks a bus up
+     * by name. Its own default for an unnamed bus is i2c-bus.0, i2c-bus.1,
+     * ... in creation order, which says nothing about which controller is
+     * which once there is more than one.
+     */
+    s->bus = i2c_init_bus(dev, s->bus_name ? s->bus_name : "i2c");
 }
 
 static void sifli_i2c_instance_init(Object *obj)
@@ -236,10 +243,15 @@ static void sifli_i2c_instance_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
+static const Property sifli_i2c_properties[] = {
+    DEFINE_PROP_STRING("bus-name", SifliI2CState, bus_name),
+};
+
 static void sifli_i2c_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, sifli_i2c_properties);
     dc->realize = sifli_i2c_realize;
     device_class_set_legacy_reset(dc, sifli_i2c_reset);
     /* No migration support: the SiFli machines do not vmstate their devices. */

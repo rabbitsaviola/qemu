@@ -22,12 +22,12 @@
 
 #include "qemu/osdep.h"
 #include "qapi/visitor.h"
-#include "hw/i2c/sifli-ft6146.h"
+#include "hw/input/ft6146.h"
 #include "hw/qdev-properties.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 
-static void sifli_ft6146_set_int(SifliFt6146State *s, bool asserted)
+static void ft6146_set_int(Ft6146State *s, bool asserted)
 {
     if (s->int_asserted == asserted) {
         return;
@@ -44,26 +44,26 @@ static void sifli_ft6146_set_int(SifliFt6146State *s, bool asserted)
  * of its own, and letting it overwrite one of these is a more faithful model
  * than not.
  */
-static void sifli_ft6146_report(SifliFt6146State *s)
+static void ft6146_report(Ft6146State *s)
 {
     unsigned x = s->touch_x & 0xfff;
     unsigned y = s->touch_y & 0xfff;
-    unsigned event = s->touch_down ? SIFLI_FT6146_EVENT_DOWN
-                                   : SIFLI_FT6146_EVENT_UP;
+    unsigned event = s->touch_down ? FT6146_EVENT_DOWN
+                                   : FT6146_EVENT_UP;
 
-    s->regs[SIFLI_FT6146_TD_STATUS] = s->touch_down ? 1 : 0;
-    s->regs[SIFLI_FT6146_P1_XH] = (event << 6) | ((x >> 8) & 0x0f);
-    s->regs[SIFLI_FT6146_P1_XL] = x & 0xff;
+    s->regs[FT6146_TD_STATUS] = s->touch_down ? 1 : 0;
+    s->regs[FT6146_P1_XH] = (event << 6) | ((x >> 8) & 0x0f);
+    s->regs[FT6146_P1_XL] = x & 0xff;
     /* Bits 7:4 of P1_YH are the point id, and this controller reports one. */
-    s->regs[SIFLI_FT6146_P1_YH] = (y >> 8) & 0x0f;
-    s->regs[SIFLI_FT6146_P1_YL] = y & 0xff;
+    s->regs[FT6146_P1_YH] = (y >> 8) & 0x0f;
+    s->regs[FT6146_P1_YL] = y & 0xff;
 
-    sifli_ft6146_set_int(s, true);
+    ft6146_set_int(s, true);
 }
 
-static int sifli_ft6146_event(I2CSlave *i2c, enum i2c_event event)
+static int ft6146_event(I2CSlave *i2c, enum i2c_event event)
 {
-    SifliFt6146State *s = SIFLI_FT6146(i2c);
+    Ft6146State *s = FT6146(i2c);
 
     switch (event) {
     case I2C_START_SEND:
@@ -77,7 +77,7 @@ static int sifli_ft6146_event(I2CSlave *i2c, enum i2c_event event)
     case I2C_FINISH:
         s->addr_phase = false;
         if (s->saw_status) {
-            sifli_ft6146_set_int(s, false);
+            ft6146_set_int(s, false);
         }
         break;
     case I2C_NACK:
@@ -87,9 +87,9 @@ static int sifli_ft6146_event(I2CSlave *i2c, enum i2c_event event)
     return 0;
 }
 
-static int sifli_ft6146_send(I2CSlave *i2c, uint8_t data)
+static int ft6146_send(I2CSlave *i2c, uint8_t data)
 {
-    SifliFt6146State *s = SIFLI_FT6146(i2c);
+    Ft6146State *s = FT6146(i2c);
 
     if (s->addr_phase) {
         s->ptr = data;
@@ -102,12 +102,12 @@ static int sifli_ft6146_send(I2CSlave *i2c, uint8_t data)
     return 0;
 }
 
-static uint8_t sifli_ft6146_recv(I2CSlave *i2c)
+static uint8_t ft6146_recv(I2CSlave *i2c)
 {
-    SifliFt6146State *s = SIFLI_FT6146(i2c);
+    Ft6146State *s = FT6146(i2c);
     uint8_t val = s->regs[s->ptr];
 
-    if (s->ptr == SIFLI_FT6146_TD_STATUS) {
+    if (s->ptr == FT6146_TD_STATUS) {
         s->saw_status = true;
     }
     s->ptr++;
@@ -120,10 +120,10 @@ static uint8_t sifli_ft6146_recv(I2CSlave *i2c)
  * move is reported the same way a press is: the driver maps both to
  * TOUCH_EVENT_DOWN.
  */
-static void sifli_ft6146_set_touch_x(Object *obj, Visitor *v, const char *name,
-                                     void *opaque, Error **errp)
+static void ft6146_set_touch_x(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
 {
-    SifliFt6146State *s = SIFLI_FT6146(obj);
+    Ft6146State *s = FT6146(obj);
     uint32_t value;
 
     if (!visit_type_uint32(v, name, &value, errp)) {
@@ -132,14 +132,14 @@ static void sifli_ft6146_set_touch_x(Object *obj, Visitor *v, const char *name,
 
     s->touch_x = value;
     if (s->touch_down) {
-        sifli_ft6146_report(s);
+        ft6146_report(s);
     }
 }
 
-static void sifli_ft6146_set_touch_y(Object *obj, Visitor *v, const char *name,
-                                     void *opaque, Error **errp)
+static void ft6146_set_touch_y(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
 {
-    SifliFt6146State *s = SIFLI_FT6146(obj);
+    Ft6146State *s = FT6146(obj);
     uint32_t value;
 
     if (!visit_type_uint32(v, name, &value, errp)) {
@@ -148,15 +148,15 @@ static void sifli_ft6146_set_touch_y(Object *obj, Visitor *v, const char *name,
 
     s->touch_y = value;
     if (s->touch_down) {
-        sifli_ft6146_report(s);
+        ft6146_report(s);
     }
 }
 
-static void sifli_ft6146_set_touch_down(Object *obj, Visitor *v,
-                                        const char *name, void *opaque,
-                                        Error **errp)
+static void ft6146_set_touch_down(Object *obj, Visitor *v,
+                                  const char *name, void *opaque,
+                                  Error **errp)
 {
-    SifliFt6146State *s = SIFLI_FT6146(obj);
+    Ft6146State *s = FT6146(obj);
     bool value;
 
     if (!visit_type_bool(v, name, &value, errp)) {
@@ -164,16 +164,16 @@ static void sifli_ft6146_set_touch_down(Object *obj, Visitor *v,
     }
 
     s->touch_down = value;
-    sifli_ft6146_report(s);
+    ft6146_report(s);
 }
 
-static void sifli_ft6146_reset_hold(Object *obj, ResetType type)
+static void ft6146_reset_hold(Object *obj, ResetType type)
 {
-    SifliFt6146State *s = SIFLI_FT6146(obj);
+    Ft6146State *s = FT6146(obj);
 
     memset(s->regs, 0, sizeof(s->regs));
-    s->regs[SIFLI_FT6146_ID_H] = s->id_h;
-    s->regs[SIFLI_FT6146_ID_L] = s->id_l;
+    s->regs[FT6146_ID_H] = s->id_h;
+    s->regs[FT6146_ID_L] = s->id_l;
 
     s->ptr = 0;
     s->addr_phase = false;
@@ -196,30 +196,41 @@ static void sifli_ft6146_reset_hold(Object *obj, ResetType type)
  * and without it the line would already be low, making the first touch -- a
  * drive low -- a 0-to-0 non-event with no edge for the bank to latch.
  */
-static void sifli_ft6146_reset_exit(Object *obj, ResetType type)
+static void ft6146_reset_exit(Object *obj, ResetType type)
 {
-    SifliFt6146State *s = SIFLI_FT6146(obj);
+    Ft6146State *s = FT6146(obj);
 
     qemu_set_irq(s->int_line, 1);
 }
 
-static void sifli_ft6146_realize(DeviceState *dev, Error **errp)
+static void ft6146_realize(DeviceState *dev, Error **errp)
 {
-    SifliFt6146State *s = SIFLI_FT6146(dev);
+    Ft6146State *s = FT6146(dev);
 
     qdev_init_gpio_out(dev, &s->int_line, 1);
+
+    /*
+     * Take the interrupt line to the pin the board routed it to. The command
+     * line can pick the bus but cannot join two devices' GPIO lines, so the
+     * chip is told where its line goes and makes the connection itself, the
+     * same way riscv-iommu-sys does with its irqchip.
+     */
+    if (s->irqchip) {
+        qdev_connect_gpio_out(dev, 0,
+                              qdev_get_gpio_in(s->irqchip, s->irq_pin));
+    }
 }
 
-static void sifli_ft6146_instance_init(Object *obj)
+static void ft6146_instance_init(Object *obj)
 {
-    SifliFt6146State *s = SIFLI_FT6146(obj);
+    Ft6146State *s = FT6146(obj);
 
     /*
      * The address the chip straps to. I2CSlave already carries an "address"
      * property, so this is a default rather than a property of its own, and
-     * "-device sifli-ft6146,address=..." still overrides it.
+     * "-device ft6146,address=..." still overrides it.
      */
-    s->parent_obj.address = SIFLI_FT6146_ADDR;
+    s->parent_obj.address = FT6146_ADDR;
 
     /*
      * Injection interface. These have side effects, so they are plain
@@ -227,54 +238,63 @@ static void sifli_ft6146_instance_init(Object *obj)
      * register file and raises the interrupt line.
      */
     object_property_add(obj, "touch-x", "uint32",
-                        NULL, sifli_ft6146_set_touch_x, NULL, NULL);
+                        NULL, ft6146_set_touch_x, NULL, NULL);
     object_property_set_description(obj, "touch-x",
         "X of the touch to inject, in panel coordinates (0..389)");
     object_property_add(obj, "touch-y", "uint32",
-                        NULL, sifli_ft6146_set_touch_y, NULL, NULL);
+                        NULL, ft6146_set_touch_y, NULL, NULL);
     object_property_set_description(obj, "touch-y",
         "Y of the touch to inject, in panel coordinates (0..449)");
     object_property_add(obj, "touch-down", "bool",
-                        NULL, sifli_ft6146_set_touch_down, NULL, NULL);
+                        NULL, ft6146_set_touch_down, NULL, NULL);
     object_property_set_description(obj, "touch-down",
         "Whether the injected touch is a press (true) or a release (false)");
 }
 
-static const Property sifli_ft6146_properties[] = {
+static const Property ft6146_properties[] = {
     /*
      * The driver prints both of these and checks neither, so the defaults
      * are zero rather than a guess at the part's real ID bytes. Set them if
      * a firmware ever does compare.
      */
-    DEFINE_PROP_UINT32("id-h", SifliFt6146State, id_h, 0),
-    DEFINE_PROP_UINT32("id-l", SifliFt6146State, id_l, 0),
+    DEFINE_PROP_UINT32("id-h", Ft6146State, id_h, 0),
+    DEFINE_PROP_UINT32("id-l", Ft6146State, id_l, 0),
+
+    /*
+     * Where the interrupt line goes: which GPIO controller, and which pin of
+     * it. Both are board wiring, so both are the board's to state; a board
+     * that leaves the pin unrouted sets neither.
+     */
+    DEFINE_PROP_LINK("irqchip", Ft6146State, irqchip, TYPE_DEVICE,
+                     DeviceState *),
+    DEFINE_PROP_UINT32("irq-pin", Ft6146State, irq_pin, 0),
 };
 
-static void sifli_ft6146_class_init(ObjectClass *klass, const void *data)
+static void ft6146_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     I2CSlaveClass *sc = I2C_SLAVE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
-    device_class_set_props(dc, sifli_ft6146_properties);
-    rc->phases.hold = sifli_ft6146_reset_hold;
-    rc->phases.exit = sifli_ft6146_reset_exit;
-    dc->realize = sifli_ft6146_realize;
+    device_class_set_props(dc, ft6146_properties);
+    rc->phases.hold = ft6146_reset_hold;
+    rc->phases.exit = ft6146_reset_exit;
+    dc->realize = ft6146_realize;
     dc->desc = "FocalTech FT6146 touch controller";
 
-    sc->event = sifli_ft6146_event;
-    sc->send = sifli_ft6146_send;
-    sc->recv = sifli_ft6146_recv;
+    sc->event = ft6146_event;
+    sc->send = ft6146_send;
+    sc->recv = ft6146_recv;
 }
 
-static const TypeInfo sifli_ft6146_types[] = {
+static const TypeInfo ft6146_types[] = {
     {
-        .name          = TYPE_SIFLI_FT6146,
+        .name          = TYPE_FT6146,
         .parent        = TYPE_I2C_SLAVE,
-        .instance_size = sizeof(SifliFt6146State),
-        .instance_init = sifli_ft6146_instance_init,
-        .class_init    = sifli_ft6146_class_init,
+        .instance_size = sizeof(Ft6146State),
+        .instance_init = ft6146_instance_init,
+        .class_init    = ft6146_class_init,
     },
 };
 
-DEFINE_TYPES(sifli_ft6146_types)
+DEFINE_TYPES(ft6146_types)
