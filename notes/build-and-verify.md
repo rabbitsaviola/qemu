@@ -452,10 +452,33 @@ WSL 里 `DISPLAY=:0` 由 WSLg 提供，不用额外配置。换屏是换命令�
 -device sifli-panel,id=0x60834200,width=480,height=272
 ```
 
-看不到画面时按这个顺序查：`-display none` 下 `screendump` 有没有内容（第 8 项
-就是自动化的这一条）→ 串口有没有 `CO5300_ReadID 0x331100` → 有没有
-`Fill framebuffer addr=`。三者依次对应读数路径、`-device` 有没有给、固件有没有
-真的在刷屏。
+#### hal/epic 也送屏，而且走的是另一条路
+
+`example/hal/epic` 混完把 `buffer2` 交给 `lcd_display_update()`。它到的不是上面
+这条 `draw_rect`，而是 `draw_rect_async`——SDK 里那个函数不直接碰 LCDC，只往
+LCD task 的消息队列塞一条 `LCD_MSG_DRAW_RECT_ASYNC`（`drv_lcd.c:1824`），由任务
+稍后处理。所以它同时压到了 rt-thread 的 task/消息队列这一层，而不只是寄存器。
+
+```bash
+cd <SDK>/example/hal/epic/project
+scons --board=sf32lb52-lcd_a128r16_hcpu -j8
+
+~/build-sifli/qemu-system-arm -M sf32lb52x -device sifli-panel -display sdl \
+    -serial stdio \
+    -kernel <SDK>/example/hal/epic/project/build_sf32lb52-lcd_a128r16_hcpu/main.elf
+```
+
+窗口里是静止画面（`main()` 只混一次，之后 `while(1) rt_thread_mdelay(1000)` 空转），
+串口先 `HAL_EPIC_Init ok`、之后每送一次屏一句 `draw_rect_async called`。**先看重叠
+区**：前景蓝 x=[50,199] y=[50,149] 和背景红 x=[100,249] y=[100,199] 相交的那块
+x=[100,199] y=[100,149] 应当是**偏暗的紫**，不是纯蓝也不是纯红。三块颜色互不相同
+才说明图层位置和叠加顺序都对，采样值见 §2② 那张表。像素对不对那一半仍由第 11 项
+自动比，这里看的是它自己能不能把画面送出去。
+
+上面 rt_driver 那条看不到画面时按这个顺序查：`-display none` 下 `screendump`
+有没有内容（第 8 项就是自动化的这一条）→ 串口有没有 `CO5300_ReadID 0x331100`
+→ 有没有 `Fill framebuffer addr=`。三者依次对应读数路径、`-device` 有没有给、
+固件有没有真的在刷屏。（hal/epic 的串口是另一套字，见上。）
 
 还有两种**跟 LCD 无关**的坏法，症状却长在屏幕上，`-d guest_errors` 里一条
 LCDC/QSPI 的报错都没有：
