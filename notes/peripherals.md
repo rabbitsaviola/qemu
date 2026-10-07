@@ -276,6 +276,9 @@ stage 字段反推（`freq = stg * 24M + 24M`），而 `EnableDLL` 写进去的�
 **USART 的波特率反而不用管**：`SystemFixClock` 是编译期常量 48 MHz
 （`bf0_hal.h:198`），BRR 由它算出来，和 RCC 寄存器无关。
 
+这条耦合现在有守卫：`notes/qtest-sifli.sh` 的 [13] 证改 HCLK 不影响 refclk 的
+周期，[14] 证 `SYST_CSR.CLKSOURCE` 一切过去速率就跟着换。
+
 ### 3.2 tick clock：SysTick 的另一个时钟源
 
 52 系列上 SysTick **不一定要**拿 HCLK 当基准。固件在 `rt_hw_systick_init`
@@ -316,6 +319,12 @@ machine 侧是**独立的第二个 Clock**（`systickclk`），接到 systick �
 改完实测：45 秒里 14 帧 `Fill framebuffer`、8 行 `__main loop__`，正是
 `mdelay(3000)` / `mdelay(5000)` 在 1 kHz 下的样子（坏着的时候 20 秒才 1 帧）。
 
+`notes/qtest-sifli.sh` 的 [13] 把这个行为钉住了：把 tick clock 程序成 800 kHz
+之后再把 HCLK 切到 240 MHz，refclk 的周期必须不变（量法是读两次 `SYST_CVR`
+取差，写法上的两个坑都写在那一项里）。**这是本树唯一改动的上游 QEMU 文件**
+（`da8df8ee59`），rebase 或摘出去合上游时最容易静默丢掉——丢了 [13] 会挂，
+以前没有任何测试会报警。
+
 ### 3.3 GTIMR：`HAL_GetTick()` 的自由计数器
 
 `HAL_GetTick()`（`drv_common.c:322`）读 `HPSYS_AON.GTIMR`（`0x500c0034`），一个
@@ -346,8 +355,10 @@ machine 侧是**独立的第二个 Clock**（`systickclk`），接到 systick �
   复位时 LPCKSEL 为 0，报 RC 速率——和硬件一致。
 - **故意不做的**：RC 那条路还有个分支，固件存了校准值就按校准频率除而不是除以
   10k（`drv_common.c:351`），模型不产生那个值；对着验的固件跑在晶振上。
-- **回归检查**：`notes/verify-sifli.sh` 第 6 项查它"在计数"，并跟着
-  `RTC_CR.LPCKSEL` 在 32768（晶振）/ 10000（RC）之间变频。
+- **回归检查**：`notes/qtest-sifli.sh` 的 [15] 查它"在计数"，并跟着
+  `RTC_CR.LPCKSEL` 在 32768（晶振）/ 10000（RC）之间变频。这一段原先在
+  `verify-sifli.sh` 的第 6 项，搬到 qtest 才进得了 CI（verify 的第 7 项会跑
+  qtest-sifli.sh，所以那边的覆盖没丢）。
 - **I2C 仍然没有模型**（I2C1–4 在 `0x5009c000` 起，见 §13.1），所以触摸屏在 QEMU
   里用不了——只是现在会干净地超时失败，不把系统挂住。验 LCD 用不着它。
 
@@ -981,7 +992,10 @@ bcc.n ...
 `HAL_RCC_HCPU_ConfigHCLK(240)` → `EnableDLL1` → `HAL_Delay_us(10)`。
 
 补了 `hw/misc/armv7m_dwt.c`（和 `armv7m_ras.c` 并列，同挂 `CONFIG_ARM_V7M`）。
-见 §11.2 关于它为什么必须挂进 armv7m 的 container。
+见 §11.2 关于它为什么必须挂进 armv7m 的 container。守卫是
+`notes/qtest-sifli.sh` 的 [16]：`DWT_CTRL` 能读写（证明那一页真的归我们，
+而不是被 `nvic-default` 吞掉），清过 `DWT_CYCCNT` 之后推一次时钟，计数器
+必须往前走——冻住的话那一项挂。
 
 ### 11.2 armv7m container 的优先级陷阱
 

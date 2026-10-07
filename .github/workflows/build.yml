@@ -130,10 +130,10 @@ jobs:
       # so a device reset cannot erase what was written -- and checks what the
       # models report back.
       #
-      # Three of its twenty-one items want the SiFli SDK: [9] and [9d] need
+      # Three of its twenty-five items want the SiFli SDK: [9] and [9d] need
       # the ezip_linux host tool and its assets, [9b] needs a decoded frame.
       # Those SKIP on a bare runner rather than failing, so the build stays
-      # green while the other eighteen gate it. Linux only: the qtests are
+      # green while the other twenty-two gate it. Linux only: the qtests are
       # about model behaviour, which does not vary by host, and the macOS and
       # Windows jobs are the ones that catch platform breakage.
       - name: SiFli qtests (Linux)

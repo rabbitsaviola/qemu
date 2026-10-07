@@ -242,59 +242,6 @@ EOF
 50008090 0x00000000 LCDC.LCD_SINGLE 不 busy
 EOF
 
-        # GTIMR 是自由计数器，不能按固定值查——只能看它动没动。
-        # HAL_GetTick() 就是它折成毫秒的结果，除以 32768 还是除以 10 取决于
-        # RTC_CR.LPCKSEL 选的是晶振还是 RC（drv_common.c:342、:360）；冻住的
-        # 话 SDK 里每个 HAL 等待循环都不再超时，未建模的外设会变成死循环而
-        # 不是干净的 HAL_TIMEOUT。rt_driver 的触摸初始化踩过这个坑。
-        #
-        # 时间必须用 qtest 的 clock_step 推，不能 `cont` 之后让客户机自己跑。
-        # 这台机器没有 -kernel，CPU 从全零 ROM 起跑，resume 后几毫秒就撞进
-        # HardFault 把 QEMU 打死；monitor 那几条命令什么时候被处理取决于主机
-        # 调度，客户机先崩第二次读就没了，报出来是"没在计数（0x… / <读不到>）"
-        # ——纯粹的调度假报（实测空载 40 次挂 3 次，加负载 30 次挂 8 次）。
-        # `-accel qtest` 不跑 CPU（accel/qtest/qtest.c 的 create_vcpu_thread 是
-        # 空实现，虚拟时钟就是它自己那个计数器），clock_step 只推计数器，读
-        # 多少遍都准。
-        #
-        # 频率不是常数：RTC_CR.LPCKSEL 置位是 32 kHz 晶振，清零是约 10 kHz 的
-        # RC（复位默认清零），HAL_GetTick() 拿同一个位决定除 32768 还是除 10
-        # （drv_common.c:342、:360），所以两边必须一致。两次读和后面变频的
-        # 读数共用一次 qtest——clock_step 会话都要靠 timeout 收尾，多起一次
-        # 就多等 30 秒。
-        vals=$(printf '%s\n' \
-                   'readl 0x500c0034' \
-                   'clock_step 1000000' 'readl 0x500c0034' \
-                   'writel 0x500cb008 0x1' \
-                   'clock_step 1000000000' 'readl 0x500c0034' \
-                   'clock_step 1000000000' 'readl 0x500c0034' \
-                   'writel 0x500cb008 0x0' \
-                   'clock_step 1000000000' 'readl 0x500c0034' \
-                   'clock_step 1000000000' 'readl 0x500c0034' \
-                   quit \
-               | timeout 30 "$BUILD/qemu-system-arm" -M sf32lb52x -display none \
-                     -serial none -accel qtest -qtest stdio 2>/dev/null \
-               | tr -d '\r' | grep '^OK 0x' | awk '{print $2}')
-        c1=$(echo "$vals" | sed -n 1p)
-        c2=$(echo "$vals" | sed -n 2p)
-        r1=$(echo "$vals" | sed -n 3p)
-        r2=$(echo "$vals" | sed -n 4p)
-        r3=$(echo "$vals" | sed -n 5p)
-        r4=$(echo "$vals" | sed -n 6p)
-        # RC 下 1 ms 该走 10 拍（10000/1000），一步不动就说明计数器是死的。
-        if [ -n "$c1" ] && [ -n "$c2" ] && [ $((c2 - c1)) -eq 10 ]; then
-            pass "HPSYS_AON.GTIMR 在计数（$c1 → $c2，1 ms 走 10 拍）"
-        else
-            fail "HPSYS_AON.GTIMR 没在计数（${c1:-<读不到>} / ${c2:-<读不到>}）"
-        fi
-        # 每个设置各走 1 秒，数这 1 秒里涨了多少。
-        if [ -z "$r4" ]; then
-            fail "HPSYS_AON.GTIMR 变频：qtest 没给出读数（${vals:-<无输出>}）"
-        elif [ $((r2 - r1)) -eq 32768 ] && [ $((r4 - r3)) -eq 10000 ]; then
-            pass "HPSYS_AON.GTIMR 跟着 RTC_CR.LPCKSEL 变频（晶振 $((r2 - r1))/s，RC $((r4 - r3))/s）"
-        else
-            fail "HPSYS_AON.GTIMR 频率不对：晶振 $((r2 - r1))/s（期望 32768），RC $((r4 - r3))/s（期望 10000）"
-        fi
     fi
 fi
 echo

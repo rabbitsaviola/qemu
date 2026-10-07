@@ -16,6 +16,9 @@
 # 请求线是外设驱动的，qtest 里没有外设，只有 MEM2MEM 这种"置 EN 就跑"的
 # 通道能在没有请求的情况下证明 address_space 那两下真的搬了字节。
 #
+# [13]–[16] 是时基那几件（SysTick / tick clock / GTIMR / DWT），要推时钟，
+# 所以单独走 run_clock()（多一个 -accel qtest），见那里的注释。
+#
 # 用法：bash notes/qtest-sifli.sh
 #
 # 环境变量可覆盖：
@@ -42,6 +45,21 @@ run_panel() {
     printf '%s\n' "$@" quit \
         | timeout 30 "$QEMU" -M sf32lb52x -display none \
               -serial none -device sifli-panel -qtest stdio 2>/dev/null | tr -d '\r'
+}
+
+# 要用 clock_step 推时基的那几项走这一条，必须显式 -accel qtest。
+# 这台机器没有 -kernel，CPU 从全零 ROM 起跑，resume 后几毫秒就撞进 HardFault
+# 把 QEMU 打死；monitor 那几条命令什么时候被处理又取决于主机调度，读第二次
+# 就没了。`-accel qtest` 不跑 CPU（accel/qtest/qtest.c 的 create_vcpu_thread
+# 是空实现，虚拟时钟就是它自己那个计数器），clock_step 只推计数器，读多少
+# 遍都准。
+#
+# 收尾靠 timeout：qtest 没有 quit 命令，stdin 关了它也不退出，所以每一轮
+# 都要等满这个超时。会话别起太多。
+run_clock() {
+    printf '%s\n' "$@" quit \
+        | timeout 30 "$QEMU" -M sf32lb52x -display none \
+              -serial none -accel qtest -qtest stdio 2>/dev/null | tr -d '\r'
 }
 
 out=$(run \
@@ -176,6 +194,29 @@ check() {
         printf '  [FAIL] %-40s 期望 %s，实际 %s\n' "$what" "$want" "${got:-<无>}"
         FAILED=$((FAILED + 1))
     fi
+}
+
+# check 的容差版，给定时器用：读 CVR 的时刻和拍边界不一定对齐，窗口里少
+# 一拍或多一拍都正常（窗口越短越明显）。want 是期望拍数，tol 是允许的偏差。
+check_near() {
+    i=$((i + 1))
+    local want=$1 tol=$2 what=$3 got
+    got=$(echo "$vals" | sed -n "${i}p" | sed 's/^OK //')
+    if [ -n "$got" ] && [ $((got)) -ge $((want - tol)) ] \
+                   && [ $((got)) -le $((want + tol)) ]; then
+        printf '  [PASS] %-40s = %s\n' "$what" "$got"
+    else
+        printf '  [FAIL] %-40s 期望 %s±%s，实际 %s\n' \
+            "$what" "$want" "$tol" "${got:-<无>}"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# 取这一轮里第 n 个读命令的返回值（十进制）。读不到当 0，由 check 去报。
+rd() {
+    local x
+    x=$(echo "$vals" | sed -n "${1}p" | sed 's/^OK //')
+    echo $(( ${x:-0} ))
 }
 
 echo "qtest 写路径验证（$QEMU）"
@@ -691,6 +732,188 @@ out=$(run \
 vals=$(echo "$out" | grep '^OK 0x')
 i=0
 check 0x0 "没有面板时读数路径回 0"
+
+echo
+echo "[13] SysTick：tick clock（refclk）速率"
+# 这一项钉的是 hw/timer/armv7m_systick.c 里 **systick_cpuclk_update() 那个**
+# return; —— 本树唯一改动的上游 QEMU 文件。SYST_CSR.CLKSOURCE=0 时 SysTick
+# 数的是 refclk，这时改 CPU 时钟**不能**动到它的周期；丢了那个 return，末段
+# 把 HCLK 切到 240 MHz 会把周期一起改掉，100 ms 读回 7222784 拍而不是
+# 80000，check_near 直接 FAIL。
+#
+# 另一个 return;（systick_refclk_update() 里的）这一项盖不到：全程
+# CLKSOURCE=0，refclk 变化时它本来就不短路，有没有那行行为一样。两个 return
+# 的守卫条件正好互补（一个 `if (!(csr & CLKSOURCE))`、一个 `if (csr & ...)`），
+# 所以得分处在两种 CLKSOURCE 下各钉一个 —— 那个由 [14] 的第二段负责。
+#
+# 量法：把 RVR 写满（24 位，100 ms 窗口内不会 wrap），读 CVR 记初值，
+# clock_step 之后读 CVR 记末值，差值就是走过的拍数。
+#   - **不要拿"写 CVR 清零"当取基准的办法**：systick_write() 的 case 0x8 确实
+#     清计数，但 ptimer 带 NO_IMMEDIATE_RELOAD，重装要等下一拍，写完之后紧接
+#     的那次读是 ~0 而不是 RVR；窗口跨过这次重装，差值就是错的。改用"先垫
+#     一步"：开 ENABLE 之后第一次读还在重装前（读回 0），所以每段窗口前面先
+#     推 10 ms，等它稳定下来。
+#   - 读的时刻和拍边界不一定对齐，所以断言带几拍容差（check_near）。
+#
+# 复位：machine 给 refclk 接了源（systickclk），QEMU 那条"没有 refclk 就
+# 强制 CLKSOURCE=1"的分支因此不生效，CSR 复位读回 0 —— 计数器是停的，
+# 得自己写 ENABLE。此刻 refclk 就是 RCC 复位选中的 LXT 32768 Hz。
+#
+# 然后按固件的做法把它程序成 800 kHz（HRC48 / TICKDIV=60，见 §3.2），量一次；
+# 再把 HCLK 切到 240 MHz（DLL1CR 的 EN + STG=9）量一次 —— 两次都必须是
+# 800 kHz，这是 systick_cpuclk_update() 那个 return 管的事（refclk 那个见 [14]）。
+out=$(run_clock \
+    'readl 0xe000e010' \
+    'writel 0xe000e014 0x00ffffff' \
+    'writel 0xe000e010 0x1' \
+    'clock_step 10000000' \
+    'readl 0xe000e018' \
+    'clock_step 100000000' \
+    'readl 0xe000e018' \
+    'writel 0x50000024 0x003c0000' \
+    'writel 0x50000020 0x00004001' \
+    'clock_step 10000000' \
+    'readl 0xe000e018' \
+    'clock_step 100000000' \
+    'readl 0xe000e018' \
+    'writel 0x5000002c 0x00000025' \
+    'writel 0x50000020 0x00004003' \
+    'clock_step 10000000' \
+    'readl 0xe000e018' \
+    'clock_step 100000000' \
+    'readl 0xe000e018')
+vals=$(echo "$out" | grep '^OK 0x')
+# CVR 是往下数的，所以窗口 = 前一次读 - 后一次读。
+csr=$(( $(rd 1) ))
+lxt=$(( $(rd 2) - $(rd 3) ))
+hrc=$(( $(rd 4) - $(rd 5) ))
+dll=$(( $(rd 6) - $(rd 7) ))
+vals=$(printf 'OK 0x%x\nOK 0x%x\nOK 0x%x\nOK 0x%x\n' "$csr" "$lxt" "$hrc" "$dll")
+i=0
+check 0x0 "复位 CSR：refclk 有源，计数器默认停着"
+check_near 3276 4 "复位 tick（LXT 32768 Hz）：100 ms 走 3276 拍"
+check_near 80000 5 "程序成 HRC48/60 后：100 ms 走 80000 拍"
+check_near 80000 5 "HCLK 切到 240 MHz 后，refclk 不动：还是 80000"
+
+echo
+echo "[14] RCC → SysTick：CLKSOURCE 门控"
+# [13] 只盖到了 systick_cpuclk_update() 那个 return;（它在 CLKSOURCE=0 下
+# 全程有效）。这一项在 CLKSOURCE=1 下盖另一个，顺带把 RCC→sysclk 那条耦合
+# 也钉住，而不是只证"CLKSOURCE 真的在选时钟"：
+#   - 把 CSR 置 1（0x5 = ENABLE | CLKSOURCE）—— 立刻按 HCLK 走；复位的
+#     sysclk 是 48 MHz（HXT48，[2] 那边量过 CSR），1 ms 正好 48000 拍。
+#   - **在 CLKSOURCE=1 期间改 tick clock**（TICKDIV 60→30，800 kHz→1.6 MHz）。
+#     这一改只走 refclk 那条回调，它必须因为 CLKSOURCE=1 而短路；丢了
+#     systick_refclk_update() 里的 return;，周期会被改成 1.6 MHz，这一段
+#     读回 1600 拍而不是 48000，直接 FAIL。
+#   - **再在 CLKSOURCE=1 期间把 HCLK 切到 240 MHz**（DLL1CR 的 EN + STG=9，
+#     同 [13]）。这一段要读到 240000 拍/ms，而不是复位那个 48000 —— 也就是
+#     说它验的是 peripherals.md §3.1 那条耦合："RCC 算出来的 sysclk 真的喂
+#     到了 SysTick"。RCC 钩子末尾那行 clock_update_hz(s->clk, …) 丢了、
+#     sysclk 永远停在 48 MHz，[13] 和本项前面两段都不会红（它们要么
+#     CLKSOURCE=0、要么只动 tick），只有这一段会读到 48000 而 FAIL。
+#   - 最后把 CSR 切回 0x1，立刻回到 800 kHz。
+out=$(run_clock \
+    'writel 0x50000024 0x003c0000' \
+    'writel 0x50000020 0x00004001' \
+    'writel 0xe000e014 0x00ffffff' \
+    'writel 0xe000e010 0x5' \
+    'clock_step 1000000' \
+    'readl 0xe000e018' \
+    'clock_step 1000000' \
+    'readl 0xe000e018' \
+    'writel 0x50000024 0x001e0000' \
+    'clock_step 1000000' \
+    'readl 0xe000e018' \
+    'writel 0x50000024 0x003c0000' \
+    'writel 0x5000002c 0x00000025' \
+    'writel 0x50000020 0x00004003' \
+    'clock_step 1000000' \
+    'readl 0xe000e018' \
+    'clock_step 1000000' \
+    'readl 0xe000e018' \
+    'writel 0xe000e010 0x1' \
+    'clock_step 1000000' \
+    'readl 0xe000e018' \
+    'clock_step 1000000' \
+    'readl 0xe000e018')
+vals=$(echo "$out" | grep '^OK 0x')
+cpu=$(( $(rd 1) - $(rd 2) ))
+gated=$(( $(rd 2) - $(rd 3) ))
+hclk=$(( $(rd 4) - $(rd 5) ))
+tick=$(( $(rd 6) - $(rd 7) ))
+vals=$(printf 'OK 0x%x\nOK 0x%x\nOK 0x%x\nOK 0x%x\n' \
+       "$cpu" "$gated" "$hclk" "$tick")
+i=0
+check_near 48000 8    "CLKSOURCE=1：HCLK 48 MHz，1 ms 走 48000 拍"
+check_near 48000 8    "CLKSOURCE=1 时把 tick 改成 1.6 MHz：cpuclk 路不动"
+check_near 240000 12  "CLKSOURCE=1 时 HCLK 切到 240 MHz：1 ms 走 240000 拍"
+check_near 800 4      "切回 CLKSOURCE=0：立刻回到 800 kHz"
+
+echo
+echo "[15] GTIMR：自由计数器，跟着 RTC_CR.LPCKSEL 变频"
+# 这一段原在 verify-sifli.sh 第 6 项，搬到 qtest 里才进得了 CI（第 7 项会跑
+# 本脚本，所以 verify 那边的覆盖没丢）。
+#
+# GTIMR 是自由计数器，不能按固定值查——只能看它动没动。HAL_GetTick() 就是
+# 它折成毫秒的结果，除以 32768 还是除以 10 取决于 RTC_CR.LPCKSEL 选的是
+# 晶振还是 RC（drv_common.c:342、:360）；冻住的话 SDK 里每个 HAL 等待循环
+# 都不再超时，未建模的外设会变成死循环而不是干净的 HAL_TIMEOUT。rt_driver
+# 的触摸初始化踩过这个坑（§3.3）。
+#
+# 频率不是常数：RTC_CR.LPCKSEL 置位是 32 kHz 晶振，清零是约 10 kHz 的 RC
+# （复位默认清零），HAL_GetTick() 拿同一个位决定除 32768 还是除 10
+# （drv_common.c:342、:360），所以两边必须一致。两次读和后面变频的读数共用
+# 一次 qtest——clock_step 会话都要靠 timeout 收尾，多起一次就多等 30 秒。
+out=$(run_clock \
+    'readl 0x500c0034' \
+    'clock_step 1000000' 'readl 0x500c0034' \
+    'writel 0x500cb008 0x1' \
+    'clock_step 1000000000' 'readl 0x500c0034' \
+    'clock_step 1000000000' 'readl 0x500c0034' \
+    'writel 0x500cb008 0x0' \
+    'clock_step 1000000000' 'readl 0x500c0034' \
+    'clock_step 1000000000' 'readl 0x500c0034')
+vals=$(echo "$out" | grep '^OK 0x')
+# 每个设置各走 1 秒，数这 1 秒里涨了多少；[6] 那类寄存器回读用不上它。
+rc=$(( $(rd 2) - $(rd 1) ))
+xt=$(( $(rd 4) - $(rd 3) ))
+rc2=$(( $(rd 6) - $(rd 5) ))
+vals=$(printf 'OK 0x%x\nOK 0x%x\nOK 0x%x\n' "$rc" "$xt" "$rc2")
+i=0
+check 10    "RC 下 1 ms 走 10 拍（计数器是活的）"
+check 32768 "LPCKSEL=1：1 秒走 32768 拍（晶振）"
+check 10000 "LPCKSEL=0：1 秒走 10000 拍（RC）"
+
+echo
+echo "[16] DWT：周期计数器在动"
+# 本树新写的设备（hw/misc/armv7m_dwt.c，落在 0xe0001000）。固件的
+# HAL_Delay_us_ 自旋在 DWT_CYCCNT 上，冻住就是死循环——而且 HAL_PreInit
+# 在能打印任何东西之前就会调到它（§11.1）。弱检查：CTRL 能读写（证明那一页
+# 是我们的，而不是被 armv7m 的 nvic-default 吞掉），清过 CYCCNT 之后推一次
+# 时钟，计数器必须往前走。
+#
+# CYCCNT 是按**主机**墙钟现算的（设备文件头解释了为什么不用虚拟时钟），
+# 所以这一推主要是让真实时间过去；clock_step 本身推不动它。
+out=$(run_clock \
+    'readl 0xe0001000' \
+    'writel 0xe0001000 0x1' \
+    'readl 0xe0001000' \
+    'writel 0xe0001004 0x0' \
+    'readl 0xe0001004' \
+    'clock_step 1000000000' \
+    'readl 0xe0001004')
+vals=$(echo "$out" | grep '^OK 0x')
+ctrl0=$(( $(rd 1) ))
+ctrl1=$(( $(rd 2) ))
+base=$(( $(rd 3) ))
+now=$(( $(rd 4) ))
+vals=$(printf 'OK 0x%x\nOK 0x%x\nOK 0x%x\n' \
+       "$ctrl0" "$ctrl1" "$(( now > base ? 1 : 0 ))")
+i=0
+check 0x0 "DWT_CTRL 复位为 0"
+check 0x1 "DWT_CTRL 可读写（0xe0001000 这一页是我们的）"
+check 0x1 "清 CYCCNT 后推一次时钟，计数器在涨"
 
 echo
 if [ "$FAILED" -eq 0 ]; then
