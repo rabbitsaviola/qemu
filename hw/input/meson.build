@@ -11,4 +11,6 @@ system_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-hos
 
 system_ss.add(when: 'CONFIG_LASIPS2', if_true: files('lasips2.c'))
 
+system_ss.add(when: 'CONFIG_TOUCH_PANEL', if_true: files('touch-panel.c'))
+
 system_ss.add(when: 'CONFIG_FT6146', if_true: files('ft6146.c'))

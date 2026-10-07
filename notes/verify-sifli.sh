@@ -78,6 +78,8 @@ hw/display/sifli-panel.c
 include/hw/display/sifli-panel.h
 hw/i2c/sifli-i2c.c
 include/hw/i2c/sifli-i2c.h
+hw/input/touch-panel.c
+include/hw/input/touch-panel.h
 hw/input/ft6146.c
 include/hw/input/ft6146.h
 hw/misc/sifli-gpio.c

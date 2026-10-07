@@ -34,7 +34,11 @@ config VHOST_USER_INPUT
 config LASIPS2
     select PS2
 
+config TOUCH_PANEL
+    bool
+
 config FT6146
     bool
+    select TOUCH_PANEL
     depends on I2C
     default y if I2C_DEVICES

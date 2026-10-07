@@ -19,6 +19,11 @@
  * which line of it. With no irqchip the interrupt goes nowhere, which is what
  * a board that leaves the pin unrouted wants.
  *
+ * None of that is particular to this part, and neither is taking an injected
+ * touch or holding the line low until it is read. It is shared with the SDK's
+ * other touch controllers and lives in hw/input/touch-panel.h; what is here
+ * is the register map and the release rule.
+ *
  * The register map below is only as large as the driver uses; see
  * customer/peripherals/touch_panel/ft6146/ft6146.c in the SDK.
  *
@@ -29,7 +34,7 @@
 #define HW_INPUT_FT6146_H
 
 #include "hw/i2c/i2c.h"
-#include "hw/irq.h"
+#include "hw/input/touch-panel.h"
 #include "qom/object.h"
 
 #define TYPE_FT6146 "ft6146"
@@ -71,6 +76,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(Ft6146State, FT6146)
 struct Ft6146State {
     I2CSlave parent_obj;
 
+    /*
+     * Everything shared with the SDK's other touch controllers: the injected
+     * touch, the interrupt line, and the board wiring that says where that
+     * line goes. See hw/input/touch-panel.h.
+     */
+    TouchPanelState tp;
+
     uint8_t regs[FT6146_NREGS];
 
     /* Where the next byte read comes from. */
@@ -88,22 +100,6 @@ struct Ft6146State {
 
     /* True once a read has covered TD_STATUS, which is what ends a touch. */
     bool saw_status;
-
-    /* The interrupt line, active low. */
-    qemu_irq int_line;
-    bool int_asserted;
-
-    /*
-     * Where that line goes. Both are board wiring, so both are properties;
-     * realize connects the line when irqchip is set. See the file comment.
-     */
-    DeviceState *irqchip;
-    uint32_t irq_pin;
-
-    /* Last injected touch. Written through the touch-* properties. */
-    uint32_t touch_x;
-    uint32_t touch_y;
-    bool touch_down;
 
     /* ID bytes, so an override can be given without editing the model. */
     uint32_t id_h;
