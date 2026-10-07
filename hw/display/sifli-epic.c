@@ -23,13 +23,24 @@
  *     reported a busy engine would spin forever rather than finish.
  *   - EOF_IRQ is sticky and the interrupt is a level, gated by
  *     SETTING.EOF_IRQ_MASK. The HAL clears it by writing the status back.
+ *   - The VL layer's rotation and scaling are done, as an inverse map from
+ *     output pixels back to source ones; see the comment on
+ *     epic_draw_layer_transformed(). A layer with no transform still takes
+ *     the rectangle path, byte for byte.
+ *   - The EZIP co-engine's decoded frame goes through that same map when the
+ *     layer is scaled. The HAL allows scaling a co-engine layer and only
+ *     refuses rotating one (bf0_hal_epic.c:6196-6204), so the two cases are
+ *     scaled and not-scaled; a co-engine layer with an angle set is not
+ *     something the HAL can produce and is drawn untransformed with a log.
  *
- * What is not here, and is logged rather than silently mis-drawn: rotation
- * (VL_ROT, VL_ROT_M_*), scaling (SCALE_RATIO_*, SCALE_INIT_*), YUV input,
- * dithering, masking (MASK_*) and output straight to the LCD
- * (AHB_CTRL.DESTINATION). A job that uses one of those still completes, so
- * that firmware waiting on it is not left hanging, but the pixels it
- * produced are not the ones hardware would have produced.
+ * What is still not here, and is logged rather than silently mis-drawn:
+ * mirroring (the HAL supports it, the SDK's own drivers never ask for it),
+ * YUV input, dithering, masking (MASK_*), the A8/A4/A2/L8 source formats
+ * (they want the colour coordinate engine and the palette), rotation of a
+ * co-engine layer, and output straight to the LCD (AHB_CTRL.DESTINATION). A
+ * job that uses one of those still completes, so that firmware waiting on it
+ * is not left hanging, but the pixels it produced are not the ones hardware
+ * would have produced.
  *
  * L1 and L2 are absent on this part: the HAL defines EPIC_L2_L1_INVALID for
  * SF32LB52X. Their registers exist and are stored, but no job can reach
@@ -49,6 +60,8 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 
+#include <math.h>
+
 /*
  * The most pixels one job may touch. A 10-bit coordinate space is 1024x1024;
  * the cap only bites on a register set that could not have come from the
@@ -65,6 +78,7 @@ typedef struct EpicLayer {
     unsigned br_off;
     unsigned src_off;
     unsigned fill_off;
+    bool transformable;     /* VL is the only layer with the ROT/SCALE block */
 } EpicLayer;
 
 /*
@@ -80,9 +94,9 @@ typedef struct EpicLayer {
  */
 static const EpicLayer epic_layers[] = {
     { "L0", 1, SIFLI_EPIC_L0_CFG, SIFLI_EPIC_L0_TL_POS, SIFLI_EPIC_L0_BR_POS,
-      SIFLI_EPIC_L0_SRC, SIFLI_EPIC_L0_FILL },
+      SIFLI_EPIC_L0_SRC, SIFLI_EPIC_L0_FILL, false },
     { "VL", 0, SIFLI_EPIC_VL_CFG, SIFLI_EPIC_VL_TL_POS, SIFLI_EPIC_VL_BR_POS,
-      SIFLI_EPIC_VL_SRC, SIFLI_EPIC_VL_FILL },
+      SIFLI_EPIC_VL_SRC, SIFLI_EPIC_VL_FILL, true },
 };
 
 typedef struct EpicPixel {
@@ -287,10 +301,11 @@ static void epic_composite(uint8_t *dst, unsigned o_format, unsigned format,
  *
  * The decoded frame is the window EZIP was asked for, in source-image
  * coordinates: frame pixel (0, 0) is source pixel (start_col, start_row), and
- * the layer's TL_POS is where source pixel (0, 0) sits on the canvas -- the
- * HAL refuses rotation and scaling for an EZIP layer (bf0_hal_epic.c:6200),
- * so those do not enter into it. The frame therefore lands at TL_POS plus the
- * window's own origin.
+ * the layer's TL_POS is where source pixel (0, 0) sits on the canvas. The HAL
+ * refuses rotating such a layer (bf0_hal_epic.c:6200) but allows scaling one,
+ * so this is only the untransformed case; epic_draw_coeng_ezip_scaled() picks
+ * up a scaled one. Here the frame lands at TL_POS plus the window's own
+ * origin.
  *
  * The decoded pixels are ARGB8888 and their alpha is always applied, which is
  * not what the ALPHA_SEL/ALPHA_BLEND reading of the layer CFG would give: the
@@ -347,6 +362,366 @@ static void epic_draw_coeng_ezip(SifliEpicState *s, const EpicLayer *l,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* VL layer rotation and scaling.                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Sign-extend one of the 11-bit fields of ROT_M_CFG2/3. They are signed on
+ * 52x; the HAL only had to fit them in an unsigned field on 55x
+ * (bf0_hal_epic.c:3193).
+ */
+static int32_t epic_vl_signed(uint32_t reg, uint32_t msk, unsigned pos)
+{
+    int32_t v = (reg & msk) >> pos;
+
+    return (v & (1 << EPIC_VL_ROT_M_SIGN_BIT)) ?
+           v - (1 << (EPIC_VL_ROT_M_SIGN_BIT + 1)) : v;
+}
+
+/*
+ * The sine and cosine the hardware rotates by, as Q16.16.
+ *
+ * The HAL computes them itself and leaves them in MISC_CFG as magnitudes in
+ * Q1.12, with the signs coming from ROT_DEG's quadrant (bf0_hal_epic.c:3168).
+ * When DEG_FORCE is clear the hardware would run its own calculator from
+ * ROT_DEG, so derive them from the angle instead.
+ *
+ * Note ROT_DEG is whole degrees: the HAL's input angle is in 0.1 degrees and
+ * it divides before writing, bumping an exact 0/90/180/270 by one so that the
+ * quadrant is defined (bf0_hal_epic.c:2551).
+ */
+static void epic_vl_sin_cos(uint32_t rot, uint32_t misc,
+                            int32_t *sin_q16, int32_t *cos_q16)
+{
+    unsigned deg = (rot & EPIC_VL_ROT_DEG_Msk) >> EPIC_VL_ROT_DEG_Pos;
+    int32_t s, c;
+
+    if (!(misc & EPIC_VL_MISC_CFG_DEG_FORCE)) {
+        const double rad = deg * 0.017453292519943295;
+
+        *sin_q16 = lround(sin(rad) * 65536.0);
+        *cos_q16 = lround(cos(rad) * 65536.0);
+        return;
+    }
+
+    s = ((misc & EPIC_VL_MISC_CFG_SIN_FORCE_VALUE_Msk) >>
+         EPIC_VL_MISC_CFG_SIN_FORCE_VALUE_Pos) <<
+        (16 - EPIC_VL_SIN_COS_FRAC_BIT);
+    c = ((misc & EPIC_VL_MISC_CFG_COS_FORCE_VALUE_Msk) >>
+         EPIC_VL_MISC_CFG_COS_FORCE_VALUE_Pos) <<
+        (16 - EPIC_VL_SIN_COS_FRAC_BIT);
+
+    /* The registers hold |sin| and |cos|; ROT_DEG says which quadrant. */
+    if (deg >= 180) {
+        s = -s;
+    }
+    if (deg >= 90 && deg < 270) {
+        c = -c;
+    }
+    *sin_q16 = s;
+    *cos_q16 = c;
+}
+
+/*
+ * Whether the VL registers ask for a transform at all. With none of these
+ * set the layer is a plain rectangle copy and takes the byte-for-byte path
+ * above, which is what keeps an untransformed job identical.
+ */
+static bool epic_vl_transform_active(SifliEpicState *s)
+{
+    uint32_t rot = s->reg[SIFLI_EPIC_VL_ROT / 4];
+    uint32_t misc = s->reg[SIFLI_EPIC_VL_MISC_CFG / 4];
+    uint32_t mcfg1 = s->reg[SIFLI_EPIC_VL_ROT_M_CFG1 / 4];
+    uint32_t pitch_h = s->reg[SIFLI_EPIC_VL_SCALE_RATIO_H / 4] &
+                       EPIC_VL_SCALE_RATIO_XPITCH_Msk;
+    uint32_t pitch_v = s->reg[SIFLI_EPIC_VL_SCALE_RATIO_V / 4] &
+                       EPIC_VL_SCALE_RATIO_YPITCH_Msk;
+
+    if ((rot & EPIC_VL_ROT_DEG_Msk) || (misc & EPIC_VL_MISC_CFG_DEG_FORCE) ||
+        (mcfg1 & EPIC_VL_ROT_M_CFG1_M_MODE)) {
+        return true;
+    }
+    /*
+     * A step of zero is not a step. The HAL writes EPIC_SCALE_1 for a layer
+     * it is not scaling -- both when it configures one and when it resets the
+     * video layer's transform (bf0_hal_epic.c:3375-3379, :3479-3483) -- and
+     * never leaves zero behind, so zero is a register set the hardware is not
+     * asked to run. Reading it as a transform would collapse the whole
+     * rectangle onto one source pixel; treat it as "not scaled".
+     */
+    if ((pitch_h != EPIC_VL_SCALE_1 && pitch_h != 0) ||
+        (pitch_v != EPIC_VL_SCALE_1 && pitch_v != 0)) {
+        return true;
+    }
+    if ((s->reg[SIFLI_EPIC_VL_SCALE_INIT_CFG1 / 4] &
+         EPIC_VL_SCALE_INIT_CFG1_X_VAL_Msk) ||
+        (s->reg[SIFLI_EPIC_VL_SCALE_INIT_CFG2 / 4] &
+         EPIC_VL_SCALE_INIT_CFG2_Y_VAL_Msk)) {
+        return true;
+    }
+    return false;
+}
+
+/*
+ * The transform registers, read together and then used to walk an output
+ * pixel back to the source coordinate it samples. Keeping them in one place
+ * lets a co-engine layer go through the same mapping a memory layer does:
+ * the HAL programs the scaler for both, and only the pixel source differs.
+ */
+typedef struct EpicVlTransform {
+    unsigned lx0, ly0;          /* the layer's TL; lx is measured from it */
+    int64_t pitch_x, pitch_y;   /* SCALE_RATIO_H/V, 16.16 */
+    int64_t init_x, init_y;     /* SCALE_INIT_CFG1/2, 16.16 */
+    int64_t pivot_x_16p16, pivot_y_16p16;
+    int64_t xtl, ytl;           /* pre-rotation source TL, signed */
+    int32_t sin_q16, cos_q16;
+    bool rotating;
+} EpicVlTransform;
+
+static void epic_vl_transform_init(SifliEpicState *s, const EpicLayer *l,
+                                   EpicVlTransform *t)
+{
+    uint32_t tl = s->reg[l->tl_off / 4];
+    uint32_t rot = s->reg[SIFLI_EPIC_VL_ROT / 4];
+    uint32_t misc = s->reg[SIFLI_EPIC_VL_MISC_CFG / 4];
+    uint32_t mcfg1 = s->reg[SIFLI_EPIC_VL_ROT_M_CFG1 / 4];
+    uint32_t mcfg2 = s->reg[SIFLI_EPIC_VL_ROT_M_CFG2 / 4];
+    uint32_t mcfg3 = s->reg[SIFLI_EPIC_VL_ROT_M_CFG3 / 4];
+    int32_t pivot_x = epic_vl_signed(mcfg2, EPIC_VL_ROT_M_CFG2_M_PIVOT_X_Msk,
+                                     EPIC_VL_ROT_M_CFG2_M_PIVOT_X_Pos);
+    int32_t pivot_y = epic_vl_signed(mcfg2, EPIC_VL_ROT_M_CFG2_M_PIVOT_Y_Msk,
+                                     EPIC_VL_ROT_M_CFG2_M_PIVOT_Y_Pos);
+
+    t->lx0 = tl & EPIC_CANVAS_X_Msk;
+    t->ly0 = (tl & EPIC_CANVAS_Y_Msk) >> EPIC_CANVAS_Y_Pos;
+    t->pitch_x = s->reg[SIFLI_EPIC_VL_SCALE_RATIO_H / 4] &
+                 EPIC_VL_SCALE_RATIO_XPITCH_Msk;
+    t->pitch_y = s->reg[SIFLI_EPIC_VL_SCALE_RATIO_V / 4] &
+                 EPIC_VL_SCALE_RATIO_YPITCH_Msk;
+    t->init_x = s->reg[SIFLI_EPIC_VL_SCALE_INIT_CFG1 / 4] &
+                EPIC_VL_SCALE_INIT_CFG1_X_VAL_Msk;
+    t->init_y = s->reg[SIFLI_EPIC_VL_SCALE_INIT_CFG2 / 4] &
+                EPIC_VL_SCALE_INIT_CFG2_Y_VAL_Msk;
+    t->pivot_x_16p16 = (int64_t)pivot_x << 16;
+    t->pivot_y_16p16 = (int64_t)pivot_y << 16;
+    t->xtl = epic_vl_signed(mcfg3, EPIC_VL_ROT_M_CFG3_M_XTL_Msk,
+                            EPIC_VL_ROT_M_CFG3_M_XTL_Pos);
+    t->ytl = epic_vl_signed(mcfg3, EPIC_VL_ROT_M_CFG3_M_YTL_Msk,
+                            EPIC_VL_ROT_M_CFG3_M_YTL_Pos);
+    t->rotating = (rot & EPIC_VL_ROT_DEG_Msk) ||
+                  (misc & EPIC_VL_MISC_CFG_DEG_FORCE) ||
+                  (mcfg1 & EPIC_VL_ROT_M_CFG1_M_MODE);
+    t->sin_q16 = 0;
+    t->cos_q16 = 0;
+    if (t->rotating) {
+        epic_vl_sin_cos(rot, misc, &t->sin_q16, &t->cos_q16);
+    }
+}
+
+/*
+ * Where the output pixel (x, y) samples the source. The HAL's own arithmetic
+ * gives the un-rotated source coordinate as
+ *
+ *     r = (scale_init + lx * pitch) >> 16
+ *
+ * with lx the pixel's offset from the layer's top-left. That is literally the
+ * expression the HAL uses to size a co-engine window (bf0_hal_epic.c:3755),
+ * and it is what DISABLE_SCALE turns into lx. Rotation is undone about the
+ * pivot, then the pre-rotation source origin is taken back off:
+ *
+ *     source = R(-angle) * (r - pivot) + pivot - src_tl
+ *
+ * so that a source pixel u lands at canvas TL + (R(angle) * (u + src_tl -
+ * pivot) + pivot) / factor, which is the placement the HAL's bounding box was
+ * built around. The sampled point is truncated, not rounded.
+ */
+static void epic_vl_transform_apply(const EpicVlTransform *t,
+                                    unsigned x, unsigned y,
+                                    int32_t *sx, int32_t *sy)
+{
+    int64_t rx = t->init_x + (int64_t)(x - t->lx0) * t->pitch_x;
+    int64_t ry = t->init_y + (int64_t)(y - t->ly0) * t->pitch_y;
+    int64_t sx_16p16, sy_16p16;
+
+    if (t->rotating) {
+        int64_t dx = rx - t->pivot_x_16p16;
+        int64_t dy = ry - t->pivot_y_16p16;
+
+        sx_16p16 = ((t->cos_q16 * dx + t->sin_q16 * dy) >> 16) +
+                   t->pivot_x_16p16 - (t->xtl << 16);
+        sy_16p16 = ((-t->sin_q16 * dx + t->cos_q16 * dy) >> 16) +
+                   t->pivot_y_16p16 - (t->ytl << 16);
+    } else {
+        sx_16p16 = rx;
+        sy_16p16 = ry;
+    }
+    *sx = sx_16p16 >> 16;
+    *sy = sy_16p16 >> 16;
+}
+
+/*
+ * The co-engine twin of epic_draw_layer_transformed(): the same mapping, with
+ * the sampled pixel taken from the EZIP decoder's frame instead of SRC.
+ *
+ * The HAL lets a co-engine layer be scaled but not rotated
+ * (bf0_hal_epic.c:6196-6204): such a job still goes through
+ * EPIC_ConfigRotation, so SCALE_RATIO, SCALE_INIT, EXTENTS and the TL/BR
+ * bounding box are programmed exactly as they are for a memory layer, and only
+ * the pixel source differs. The frame is the window EZIP was asked to decode,
+ * which EPIC_CalcDecImgArea derived from the same source-side clip area that
+ * produced EXTENTS (bf0_hal_epic.c:3696-3790). A canvas pixel that maps to the
+ * source coordinate (sx, sy) is therefore frame pixel
+ *
+ *     (sx - start_col, sy - start_row)
+ *
+ * and anything that lands outside the window is left undrawn -- the frame is
+ * the clipped region, so it bounds the read on its own. Sampling and blending
+ * match the untransformed co-engine path, alpha included.
+ */
+static void epic_draw_coeng_ezip_scaled(SifliEpicState *s, const EpicLayer *l,
+                                        const EpicVlTransform *t,
+                                        uint8_t *canvas, unsigned cx0,
+                                        unsigned cy0, unsigned cw, unsigned ch,
+                                        unsigned dst_bpp, unsigned o_format,
+                                        unsigned lx1, unsigned ly1)
+{
+    SifliEzipFrame frame;
+    unsigned x, y;
+
+    if (s->ezip == NULL || !sifli_ezip_coeng_frame(s->ezip, &frame)) {
+        /* Same report as the untransformed path: nothing to sample. */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sifli-epic: %s is fed by the EZIP co-engine but no "
+                      "decoded frame is available; the layer is skipped\n",
+                      l->name);
+        return;
+    }
+
+    for (y = MAX(t->ly0, cy0); y <= MIN(ly1, cy0 + ch - 1); y++) {
+        for (x = MAX(t->lx0, cx0); x <= MIN(lx1, cx0 + cw - 1); x++) {
+            const uint8_t *raw;
+            uint8_t *dst;
+            EpicPixel px;
+            int32_t sx, sy;
+            unsigned fx, fy;
+
+            epic_vl_transform_apply(t, x, y, &sx, &sy);
+            if (sx < (int32_t)frame.start_col ||
+                sy < (int32_t)frame.start_row) {
+                continue;
+            }
+            fx = sx - frame.start_col;
+            fy = sy - frame.start_row;
+            if (fx >= frame.width || fy >= frame.height) {
+                continue;
+            }
+
+            raw = frame.pixels + ((size_t)fy * frame.width + fx) * 4;
+            dst = canvas + ((y - cy0) * cw + (x - cx0)) * dst_bpp;
+            px = epic_decode_pixel(raw, EPIC_FMT_ARGB8888);
+            epic_composite(dst, o_format, EPIC_FMT_ARGB8888, px, px.a);
+        }
+    }
+}
+
+/*
+ * Draw the VL layer through the rotation and scaling unit.
+ *
+ * The HAL does the forward transform on the CPU -- it works out where the
+ * rotated and scaled image lands and programs TL_POS/BR_POS, the rotated
+ * extent, the pivot, the source top-left and the scale step accordingly
+ * (bf0_hal_epic.c:2506-2966, written out at :3145-3250). The hardware then
+ * runs that backwards, one output pixel at a time, and that is what this does:
+ * epic_vl_transform_apply() maps the pixel, and the sampled point is read from
+ * SRC. The source region the layer may read is the clipped one EXTENTS
+ * describes -- the same bound EPIC_CalcDecImgArea walks. Nothing outside it is
+ * drawn.
+ *
+ * Sampling is nearest-neighbour: FILTER_EN is the monochrome colour
+ * substitute, not an interpolation control (see the header).
+ */
+static void epic_draw_layer_transformed(SifliEpicState *s, const EpicLayer *l,
+                                        uint8_t *canvas, unsigned cx0,
+                                        unsigned cy0, unsigned cw, unsigned ch,
+                                        unsigned dst_bpp, unsigned o_format)
+{
+    uint32_t cfg = s->reg[l->cfg_off / 4];
+    uint32_t br = s->reg[l->br_off / 4];
+    uint32_t misc = s->reg[SIFLI_EPIC_VL_MISC_CFG / 4];
+    uint32_t extents = s->reg[SIFLI_EPIC_VL_EXTENTS / 4];
+    unsigned format = cfg & EPIC_L_CFG_FORMAT_Msk;
+    unsigned src_bpp = epic_src_bpp(format);
+    unsigned src_stride = (cfg & EPIC_L_CFG_WIDTH_Msk) >> EPIC_L_CFG_WIDTH_Pos;
+    unsigned alpha = (cfg & EPIC_L_CFG_ALPHA_Msk) >> EPIC_L_CFG_ALPHA_Pos;
+    bool alpha_sel = (cfg & EPIC_L_CFG_ALPHA_SEL) != 0;
+    bool blend = (cfg & EPIC_L_CFG_ALPHA_BLEND) != 0;
+    uint32_t src = sifli_sbus_to_cpu_addr(s->reg[l->src_off / 4]);
+    unsigned max_col = (extents & EPIC_VL_EXTENTS_MAX_COL_Msk) >>
+                       EPIC_VL_EXTENTS_MAX_COL_Pos;
+    unsigned max_line = (extents & EPIC_VL_EXTENTS_MAX_LINE_Msk) >>
+                        EPIC_VL_EXTENTS_MAX_LINE_Pos;
+    unsigned lx1 = br & EPIC_CANVAS_X_Msk;
+    unsigned ly1 = (br & EPIC_CANVAS_Y_Msk) >> EPIC_CANVAS_Y_Pos;
+    EpicVlTransform t;
+    unsigned x, y;
+
+    epic_vl_transform_init(s, l, &t);
+
+    if (misc & (EPIC_VL_MISC_CFG_H_MIRROR | EPIC_VL_MISC_CFG_V_MIRROR)) {
+        /*
+         * Mirroring is part of the same unit but is not modelled: the HAL
+         * only reaches it from a caller that sets h_mirror/v_mirror, and the
+         * SDK's own drivers never do. Drawing it unmirrored is wrong in the
+         * same way the whole layer used to be, but it is not silent.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sifli-epic: %s asks for mirroring, which is not "
+                      "implemented; it is drawn unmirrored\n", l->name);
+    }
+
+    for (y = MAX(t.ly0, cy0); y <= MIN(ly1, cy0 + ch - 1); y++) {
+        for (x = MAX(t.lx0, cx0); x <= MIN(lx1, cx0 + cw - 1); x++) {
+            int64_t addr;
+            int32_t sx, sy;
+            uint8_t raw[4];
+            EpicPixel px;
+            uint8_t *dst;
+            unsigned a;
+
+            epic_vl_transform_apply(&t, x, y, &sx, &sy);
+
+            /*
+             * Only the region the HAL clipped -- and told the hardware about
+             * through EXTENTS -- is drawn. Everything else is left as it was.
+             */
+            if (sx < 0 || sy < 0 || sx > (int32_t)max_col ||
+                sy > (int32_t)max_line) {
+                continue;
+            }
+
+            addr = (int64_t)src + (int64_t)sy * src_stride +
+                   (int64_t)sx * src_bpp;
+            if (addr < 0 || addr > UINT32_MAX ||
+                !epic_guest_read(addr, raw, src_bpp)) {
+                continue;
+            }
+
+            px = epic_decode_pixel(raw, format);
+            if (alpha_sel) {
+                a = alpha;
+            } else if (blend) {
+                a = px.a;
+            } else {
+                a = 255;
+            }
+
+            dst = canvas + ((y - cy0) * cw + (x - cx0)) * dst_bpp;
+            epic_composite(dst, o_format, format, px, a);
+        }
+    }
+}
+
 /*
  * Composite one layer onto the canvas.
  *
@@ -391,6 +766,32 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
     if ((coeng & EPIC_COENG_CFG_EZIP_EN) &&
         ((coeng & EPIC_COENG_CFG_EZIP_CH_SEL_Msk) >>
          EPIC_COENG_CFG_EZIP_CH_SEL_Pos) == l->channel) {
+        if (l->transformable && epic_vl_transform_active(s)) {
+            EpicVlTransform t;
+
+            epic_vl_transform_init(s, l, &t);
+            if (!t.rotating) {
+                /*
+                 * The HAL allows scaling a co-engine layer
+                 * (bf0_hal_epic.c:6196-6204), and the scaler is programmed
+                 * for it just as it is for a memory layer, so run the coded
+                 * frame through the same inverse map and sample it there.
+                 */
+                epic_draw_coeng_ezip_scaled(s, l, &t, canvas, cx0, cy0, cw,
+                                            ch, dst_bpp, o_format, lx1, ly1);
+                return;
+            }
+            /*
+             * Rotation is the one transform the HAL refuses for an EZIP
+             * layer (bf0_hal_epic.c:6200), so this register set cannot come
+             * from it. Draw the window untransformed rather than guess, and
+             * say so.
+             */
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sifli-epic: %s is fed by the EZIP co-engine with "
+                          "a rotation configured; the co-engine path does "
+                          "not apply it\n", l->name);
+        }
         epic_draw_coeng_ezip(s, l, canvas, cx0, cy0, cw, ch, dst_bpp,
                              o_format, lx0, ly0, lx1, ly1);
         return;
@@ -416,6 +817,17 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sifli-epic: %s uses source format %u, which is not "
                       "implemented; the layer is skipped\n", l->name, format);
+        return;
+    }
+
+    /*
+     * A transform is the one thing that stops the layer being a plain
+     * rectangle read: it re-reads the same registers as a mapping from
+     * output pixels back to source ones.
+     */
+    if (l->transformable && epic_vl_transform_active(s)) {
+        epic_draw_layer_transformed(s, l, canvas, cx0, cy0, cw, ch, dst_bpp,
+                                    o_format);
         return;
     }
 

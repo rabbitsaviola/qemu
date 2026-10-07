@@ -155,6 +155,14 @@ enum {
 #define EPIC_L_CFG_WIDTH_Msk        (0x1fffu << 16)
 #define EPIC_L_CFG_ACTIVE           BIT(30)
 #define EPIC_L_CFG_ALPHA_BLEND      BIT(31)
+/*
+ * CFG.FILTER_EN only ever accompanies the FILTER register's RGB, which the
+ * HAL uses to substitute a colour for the ones an A8/L8 source cannot carry
+ * (bf0_hal_epic.c:3128). It is not a resampling filter: no register selects
+ * an interpolation kernel for the scaler, so a scaled VL layer is sampled
+ * nearest-neighbour.
+ */
+#define EPIC_L_CFG_FILTER_EN        BIT(15)
 
 /* Source pixel formats, from EPIC_L0_CFG_FMT_*. */
 enum {
@@ -185,6 +193,94 @@ enum {
 #define EPIC_COENG_CFG_EZIP_EN          BIT(0)
 #define EPIC_COENG_CFG_EZIP_CH_SEL_Pos  1
 #define EPIC_COENG_CFG_EZIP_CH_SEL_Msk  (3u << 1)
+
+/*
+ * The VL transform registers. VL is the only layer on 52x with them: L0 has
+ * no ROT/SCALE block, and L1/L2 do not exist on the part. The HAL computes
+ * the whole transform on the CPU and leaves these as the result, so the model
+ * reads them as the hardware would (bf0_hal_epic.c:3145-3250).
+ */
+
+/*
+ * VL_ROT. ROT_DEG is in whole degrees, not tenths: the HAL's input angle is
+ * in 0.1 degrees and it divides by ten first, then bumps an exact 0/90/180/270
+ * to the neighbouring degree so the quadrant is defined (bf0_hal_epic.c:2551).
+ * DEG_FORCE carries "use the forced sin/cos below" and lives in MISC_CFG on
+ * this part, not here.
+ */
+#define EPIC_VL_ROT_CALC_REQ        BIT(0)
+#define EPIC_VL_ROT_CALC_CLR        BIT(1)
+#define EPIC_VL_ROT_DEG_Pos         2
+#define EPIC_VL_ROT_DEG_Msk         (0x1ffu << 2)
+
+/*
+ * VL_MISC_CFG: the forced sine and cosine, the mirror bits, and the palette
+ * select. The sin/cos are magnitudes only -- the quadrant comes from ROT_DEG
+ * -- and are Q1.12, which is the HAL's Q1.15 table shifted down by
+ * EPIC_SIN_COS_FRAC_BIT - EPIC_VL_MISC_CFG_SIN_FRAC_BIT (15 - 12).
+ */
+#define EPIC_VL_MISC_CFG_CLUT_SEL   BIT(0)
+#define EPIC_VL_MISC_CFG_V_MIRROR   BIT(1)
+#define EPIC_VL_MISC_CFG_H_MIRROR   BIT(2)
+#define EPIC_VL_MISC_CFG_COS_FORCE_VALUE_Pos 3
+#define EPIC_VL_MISC_CFG_COS_FORCE_VALUE_Msk (0x1fffu << 3)
+#define EPIC_VL_MISC_CFG_SIN_FORCE_VALUE_Pos 16
+#define EPIC_VL_MISC_CFG_SIN_FORCE_VALUE_Msk (0x1fffu << 16)
+#define EPIC_VL_MISC_CFG_DEG_FORCE  BIT(29)
+#define EPIC_VL_SIN_COS_FRAC_BIT    12
+
+/*
+ * VL_SCALE_RATIO_H/V: the scale step, 16.16, so 1.0 is 0x10000. The HAL
+ * converts its 1024-is-1.0 input by shifting left by (16 - 10)
+ * (EPIC_CONV_SCALE_FACTOR, bf0_hal_epic.c:64) and refuses anything above the
+ * field, so the value here is what the hardware steps the source by for each
+ * output pixel.
+ */
+#define EPIC_VL_SCALE_RATIO_XPITCH_Pos  0
+#define EPIC_VL_SCALE_RATIO_XPITCH_Msk  (0x3ffffffu << 0)
+#define EPIC_VL_SCALE_RATIO_YPITCH_Pos  0
+#define EPIC_VL_SCALE_RATIO_YPITCH_Msk  (0x3ffffffu << 0)
+#define EPIC_VL_SCALE_1             (1u << 16)
+
+/*
+ * VL_EXTENTS: the size, as a max index, of the source region SRC points at.
+ * The HAL fills it from the clipped source area
+ * (bf0_hal_epic.c:3145), which is also the region it walks in
+ * EPIC_CalcDecImgArea (bf0_hal_epic.c:3755) -- so it is the bound a scaled or
+ * rotated layer may sample within.
+ */
+#define EPIC_VL_EXTENTS_MAX_LINE_Pos 0
+#define EPIC_VL_EXTENTS_MAX_LINE_Msk (0x3ffu << 0)
+#define EPIC_VL_EXTENTS_MAX_COL_Pos 16
+#define EPIC_VL_EXTENTS_MAX_COL_Msk (0x3ffu << 16)
+
+/* VL_ROT_M_CFG1: the rotated image's extent, before scaling, and M_MODE. */
+#define EPIC_VL_ROT_M_CFG1_M_ROT_MAX_LINE_Pos 0
+#define EPIC_VL_ROT_M_CFG1_M_ROT_MAX_LINE_Msk (0x7ffu << 0)
+#define EPIC_VL_ROT_M_CFG1_M_ROT_MAX_COL_Pos 16
+#define EPIC_VL_ROT_M_CFG1_M_ROT_MAX_COL_Msk (0x7ffu << 16)
+#define EPIC_VL_ROT_M_CFG1_M_MODE            BIT(31)
+
+/*
+ * VL_ROT_M_CFG2 and VL_ROT_M_CFG3: the pivot and the pre-rotation source
+ * top-left, both relative to the layer's own top-left and both signed on
+ * 52x (the 55x HAL had to keep them non-negative). Eleven bits each.
+ */
+#define EPIC_VL_ROT_M_CFG2_M_PIVOT_X_Pos 0
+#define EPIC_VL_ROT_M_CFG2_M_PIVOT_X_Msk (0x7ffu << 0)
+#define EPIC_VL_ROT_M_CFG2_M_PIVOT_Y_Pos 16
+#define EPIC_VL_ROT_M_CFG2_M_PIVOT_Y_Msk (0x7ffu << 16)
+#define EPIC_VL_ROT_M_CFG3_M_XTL_Pos     0
+#define EPIC_VL_ROT_M_CFG3_M_XTL_Msk     (0x7ffu << 0)
+#define EPIC_VL_ROT_M_CFG3_M_YTL_Pos     16
+#define EPIC_VL_ROT_M_CFG3_M_YTL_Msk     (0x7ffu << 16)
+#define EPIC_VL_ROT_M_SIGN_BIT           10
+
+/* VL_SCALE_INIT_CFG1/2: the initial scaling phase, in 16.16. */
+#define EPIC_VL_SCALE_INIT_CFG1_X_VAL_Pos 0
+#define EPIC_VL_SCALE_INIT_CFG1_X_VAL_Msk (0x3ffffffu << 0)
+#define EPIC_VL_SCALE_INIT_CFG2_Y_VAL_Pos 0
+#define EPIC_VL_SCALE_INIT_CFG2_Y_VAL_Msk (0x3ffffffu << 0)
 
 enum {
     EPIC_OUT_RGB565 = 0,
