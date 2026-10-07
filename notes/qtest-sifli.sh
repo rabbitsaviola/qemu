@@ -35,10 +35,17 @@ FAILED=0
 
 [ -x "$QEMU" ] || { echo "找不到 $QEMU，先跑 notes/build-sifli.sh"; exit 1; }
 
+# -accel qtest 是关键，不是省事：这台机器不带 -kernel，CPU 从全零 ROM 起跑，
+# 几毫秒就撞进 HardFault，QEMU 当成致命错直接 abort。命令流和这次 abort 谁先
+# 到主循环看主机调度——输的那次整段输出在被人读走之前就没了，check 报出来是
+# "实际 <无>"，现场什么都不剩（LCDC 的帧路径就是这么在 verify-sifli.sh 里挂
+# 掉、单独跑却次次通过的）。-accel qtest 下根本没有 vCPU 线程可崩，这一段
+# 又全是 MMIO 访问，不跑 CPU 结果不变。verify-sifli.sh 第 6 项的 GTIMR 也是
+# 同一个原因用了它。
 run() {
     # 不合并 stderr：那里的 [R ...]/[S ...] 是 qtest 的 trace，会打乱取值顺序
     printf '%s\n' "$@" quit \
-        | timeout 30 "$QEMU" -M sf32lb52x -display none \
+        | timeout 30 "$QEMU" -M sf32lb52x -display none -accel qtest \
               -serial none -qtest stdio 2>/dev/null | tr -d '\r'
 }
 
@@ -46,7 +53,7 @@ run() {
 # 才建，面板 realize 时把自己反向注册给 LCDC 的 QSPI 总线。
 run_panel() {
     printf '%s\n' "$@" quit \
-        | timeout 30 "$QEMU" -M sf32lb52x -display none \
+        | timeout 30 "$QEMU" -M sf32lb52x -display none -accel qtest \
               -serial none -device sifli-panel -qtest stdio 2>/dev/null | tr -d '\r'
 }
 
