@@ -123,6 +123,23 @@ jobs:
           ./dist/bin/qemu-system-arm.exe --version
           ./dist/bin/qemu-system-arm.exe -M help | grep -q '^sf32lb52x'
 
+      # Everything above tests the build; nothing tests the models. The
+      # peripheral models are the whole point of this tree, and the smoke test
+      # only shows the machine is registered. notes/qtest-sifli.sh drives
+      # their register write paths through address_space -- not MMIO stores,
+      # so a device reset cannot erase what was written -- and checks what the
+      # models report back.
+      #
+      # Three of its twenty-one items want the SiFli SDK: [9] and [9d] need
+      # the ezip_linux host tool and its assets, [9b] needs a decoded frame.
+      # Those SKIP on a bare runner rather than failing, so the build stays
+      # green while the other eighteen gate it. Linux only: the qtests are
+      # about model behaviour, which does not vary by host, and the macOS and
+      # Windows jobs are the ones that catch platform breakage.
+      - name: SiFli qtests (Linux)
+        if: matrix.os == 'linux'
+        run: SIFLI_QEMU_BUILD=dist/bin bash notes/qtest-sifli.sh
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
