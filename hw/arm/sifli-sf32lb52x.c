@@ -389,6 +389,10 @@ static void sifli_sf32lb52x_init(MachineState *machine)
         dmas[d->id] = dev;
     }
 
+    /* EXTDMA copies LVGL partial buffers into the LCD framebuffer. */
+    sysbus_create_simple("sifli-extdma", 0x50001000,
+                         qdev_get_gpio_in(armv7m, 77));
+
     /*
      * All five USARTs exist so that firmware probing them finds something.
      * Only the first is given a backend: it is the one a board wires to the

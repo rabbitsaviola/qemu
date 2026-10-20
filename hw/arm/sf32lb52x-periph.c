@@ -401,8 +401,9 @@ static const SifliRegDef sf32lb52x_hpsys_cfg_regs[] = {
      * drv_common.c:712 calls __HAL_SYSCFG_CHECK_REVID(), which is a
      * HAL_ASSERT that REVID is one of 0x03, 0x07 or 0x0f. Reading zero
      * fails it, and HAL_AssertFailed() is a while(1). Report revision A4.
+     * SID must identify SiFli (0xc2); the SDK font library checks it.
      */
-    { .off = HPSYS_CFG_IDR, .reset = 0x00000707, .readonly = ~0u },
+    { .off = HPSYS_CFG_IDR, .reset = 0xc2000707, .readonly = ~0u },
 
     { .off = HPSYS_CFG_SWCR },
     { .off = HPSYS_CFG_SCR },

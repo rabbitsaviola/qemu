@@ -35,8 +35,8 @@
  *
  * What is still not here, and is logged rather than silently mis-drawn:
  * mirroring (the HAL supports it, the SDK's own drivers never ask for it),
- * YUV input, dithering, masking (MASK_*), the A8/A4/A2/L8 source formats
- * (they want the colour coordinate engine and the palette), rotation of a
+ * YUV input, dithering, the L8 source format
+ * (which needs the palette), rotation of a
  * co-engine layer, and output straight to the LCD (AHB_CTRL.DESTINATION). A
  * job that uses one of those still completes, so that firmware waiting on it
  * is not left hanging, but the pixels it produced are not the ones hardware
@@ -109,16 +109,15 @@ typedef struct EpicPixel {
 
 /*
  * Bytes per pixel of a source layer, by CFG.FORMAT. A4 and A2 are packed,
- * so they have no whole number of bytes per pixel; they are reported as one
- * and refused by epic_layer_pixel(), which is honest about not supporting
- * them rather than indexing off the end of a row.
+ * so they have no whole number of bytes per pixel; the pixel reader
+ * handles their sub-byte addressing separately.
  */
 static unsigned epic_src_bpp(unsigned format)
 {
     switch (format) {
     case EPIC_FMT_RGB565:
-    case EPIC_FMT_ARGB8565:
         return 2;
+    case EPIC_FMT_ARGB8565:
     case EPIC_FMT_RGB888:
         return 3;
     case EPIC_FMT_ARGB8888:
@@ -203,6 +202,65 @@ static EpicPixel epic_decode_pixel(const uint8_t *p, unsigned format)
     return px;
 }
 
+/* Ax layers carry their colour in FILL; ALPHA scales per-pixel coverage. */
+static unsigned epic_layer_alpha(SifliEpicState *s, const EpicLayer *l,
+                                 unsigned cfg, unsigned format, EpicPixel *px)
+{
+    unsigned alpha = (cfg & EPIC_L_CFG_ALPHA_Msk) >> EPIC_L_CFG_ALPHA_Pos;
+
+    if (format == EPIC_FMT_A8 || format == EPIC_FMT_A4 ||
+        format == EPIC_FMT_A2) {
+        uint32_t fill = s->reg[l->fill_off / 4];
+
+        px->r = (fill >> 16) & 0xff;
+        px->g = (fill >> 8) & 0xff;
+        px->b = fill & 0xff;
+    }
+
+    if (cfg & EPIC_L_CFG_ALPHA_SEL) {
+        return alpha;
+    }
+    if (cfg & EPIC_L_CFG_ALPHA_BLEND) {
+        return (px->a * alpha + 127) / 255;
+    }
+    return px->a;
+}
+
+/* MASK coordinates are canvas coordinates, independent of source transforms. */
+static unsigned epic_mask_alpha(SifliEpicState *s, const EpicLayer *l,
+                                unsigned x, unsigned y, unsigned alpha)
+{
+    uint32_t cfg = s->reg[SIFLI_EPIC_MASK_CFG / 4];
+    uint32_t enable = l->transformable ? EPIC_MASK_CFG_VL_EN :
+                                       EPIC_MASK_CFG_L0_EN;
+    uint32_t tl, br, src, stride;
+    unsigned x0, y0, mx;
+    uint8_t mask;
+
+    if (!(cfg & EPIC_MASK_CFG_ACTIVE) || !(cfg & enable)) {
+        return alpha;
+    }
+    tl = s->reg[SIFLI_EPIC_MASK_TL_POS / 4];
+    br = s->reg[SIFLI_EPIC_MASK_BR_POS / 4];
+    x0 = tl & EPIC_CANVAS_X_Msk;
+    y0 = (tl & EPIC_CANVAS_Y_Msk) >> EPIC_CANVAS_Y_Pos;
+    if (x < x0 || y < y0 || x > (br & EPIC_CANVAS_X_Msk) ||
+        y > ((br & EPIC_CANVAS_Y_Msk) >> EPIC_CANVAS_Y_Pos)) {
+        return 0;
+    }
+    stride = (cfg & EPIC_MASK_CFG_WIDTH_Msk) >> EPIC_MASK_CFG_WIDTH_Pos;
+    src = sifli_sbus_to_mapped_cpu_addr(s->reg[SIFLI_EPIC_MASK_SRC / 4]);
+    mx = x - x0;
+    cpu_physical_memory_read(src + (y - y0) * stride +
+                             ((cfg & EPIC_MASK_CFG_A4) ? mx / 2 : mx),
+                             &mask, 1);
+    if (cfg & EPIC_MASK_CFG_A4) {
+        mask = ((mask >> ((mx & 1) * 4)) & 15) * 17;
+    }
+    return (cfg & EPIC_MASK_CFG_OVERWRITE) ? mask :
+           (alpha * mask + 127) / 255;
+}
+
 static void epic_encode_pixel(uint8_t *p, unsigned o_format, EpicPixel px)
 {
     switch (o_format) {
@@ -236,6 +294,36 @@ static bool epic_guest_read(uint32_t addr, void *buf, size_t len)
 {
     return address_space_read(&address_space_memory, addr,
                               MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK;
+}
+
+/* Ax samples are low-bit first, with each row padded to a byte. */
+static bool epic_read_pixel(uint32_t src, unsigned stride, unsigned x,
+                            unsigned y, unsigned format, EpicPixel *px)
+{
+    unsigned bits = format == EPIC_FMT_A4 ? 4 :
+                    format == EPIC_FMT_A2 ? 2 : 0;
+    unsigned bytes = epic_src_bpp(format);
+    uint64_t offset = bits ? (uint64_t)x * bits / 8 : (uint64_t)x * bytes;
+    uint64_t addr = src + (uint64_t)y * stride + offset;
+    uint8_t raw[4];
+
+    /* HAL encodes a constant-colour MONO layer as A8 with zero stride. */
+    if (!stride && format == EPIC_FMT_A8) {
+        *px = (EpicPixel) { .a = 255 };
+        return true;
+    }
+    if (addr > UINT32_MAX ||
+        !epic_guest_read(addr, raw, bits ? 1 : bytes)) {
+        return false;
+    }
+    if (bits) {
+        unsigned mask = (1u << bits) - 1;
+        *px = (EpicPixel) { .a = ((raw[0] >> ((x * bits) % 8)) & mask) *
+                                 (255 / mask) };
+    } else {
+        *px = epic_decode_pixel(raw, format);
+    }
+    return true;
 }
 
 static bool epic_guest_write(uint32_t addr, const void *buf, size_t len)
@@ -283,11 +371,19 @@ static void epic_composite(uint8_t *dst, unsigned o_format, unsigned format,
 {
     if (a != 255) {
         EpicPixel under = epic_decode_pixel(dst, o_format);
+        unsigned out_a = a + (under.a * (255 - a) + 127) / 255;
+        unsigned weight = under.a * (255 - a);
+        unsigned denominator = a * 255 + weight;
 
-        px.r = (px.r * a + under.r * (255 - a) + 127) / 255;
-        px.g = (px.g * a + under.g * (255 - a) + 127) / 255;
-        px.b = (px.b * a + under.b * (255 - a) + 127) / 255;
-        px.a = a + (under.a * (255 - a) + 127) / 255;
+        if (denominator) {
+            px.r = (px.r * a * 255 + under.r * weight + denominator / 2) /
+                   denominator;
+            px.g = (px.g * a * 255 + under.g * weight + denominator / 2) /
+                   denominator;
+            px.b = (px.b * a * 255 + under.b * weight + denominator / 2) /
+                   denominator;
+        }
+        px.a = out_a;
     } else if (format == EPIC_FMT_RGB565 || format == EPIC_FMT_RGB888) {
         /* No alpha channel in the source; the output has one. */
         px.a = 255;
@@ -300,12 +396,11 @@ static void epic_composite(uint8_t *dst, unsigned o_format, unsigned format,
  * Draw a layer whose pixels come from the EZIP co-engine instead of memory.
  *
  * The decoded frame is the window EZIP was asked for, in source-image
- * coordinates: frame pixel (0, 0) is source pixel (start_col, start_row), and
- * the layer's TL_POS is where source pixel (0, 0) sits on the canvas. The HAL
- * refuses rotating such a layer (bf0_hal_epic.c:6200) but allows scaling one,
- * so this is only the untransformed case; epic_draw_coeng_ezip_scaled() picks
- * up a scaled one. Here the frame lands at TL_POS plus the window's own
- * origin.
+ * coordinates: frame pixel (0, 0) is source pixel (start_col, start_row).
+ * The layer registers describe the clipped source, so this window begins
+ * at the layer/canvas intersection. The HAL refuses rotating such a layer
+ * (bf0_hal_epic.c:6200) but allows scaling one, so this is only the
+ * untransformed case; epic_draw_coeng_ezip_scaled() handles scaling.
  *
  * The decoded pixels are ARGB8888 and their alpha is always applied, which is
  * not what the ALPHA_SEL/ALPHA_BLEND reading of the layer CFG would give: the
@@ -337,9 +432,9 @@ static void epic_draw_coeng_ezip(SifliEpicState *s, const EpicLayer *l,
         return;
     }
 
-    /* Where the window sits on the canvas: layer TL plus the window origin. */
-    fx0 = lx0 + frame.start_col;
-    fy0 = ly0 + frame.start_row;
+    /* The decoded window starts at the layer/canvas intersection. */
+    fx0 = MAX(lx0, cx0);
+    fy0 = MAX(ly0, cy0);
     x0 = MAX(fx0, MAX(lx0, cx0));
     y0 = MAX(fy0, MAX(ly0, cy0));
     x1 = MIN(fx0 + frame.width - 1, MIN(lx1, cx0 + cw - 1));
@@ -356,8 +451,11 @@ static void epic_draw_coeng_ezip(SifliEpicState *s, const EpicLayer *l,
             const uint8_t *raw = row + (size_t)(x - fx0) * 4;
             uint8_t *dst = canvas + ((y - cy0) * cw + (x - cx0)) * dst_bpp;
             EpicPixel px = epic_decode_pixel(raw, EPIC_FMT_ARGB8888);
+            unsigned a = epic_layer_alpha(s, l, s->reg[l->cfg_off / 4],
+                                           EPIC_FMT_ARGB8888, &px);
 
-            epic_composite(dst, o_format, EPIC_FMT_ARGB8888, px, px.a);
+            a = epic_mask_alpha(s, l, x, y, a);
+            epic_composite(dst, o_format, EPIC_FMT_ARGB8888, px, a);
         }
     }
 }
@@ -536,9 +634,9 @@ static void epic_vl_transform_init(SifliEpicState *s, const EpicLayer *l,
  * pivot) + pivot) / factor, which is the placement the HAL's bounding box was
  * built around. The sampled point is truncated, not rounded.
  */
-static void epic_vl_transform_apply(const EpicVlTransform *t,
+static void epic_vl_transform_fixed(const EpicVlTransform *t,
                                     unsigned x, unsigned y,
-                                    int32_t *sx, int32_t *sy)
+                                    int64_t *sx, int64_t *sy)
 {
     int64_t rx = t->init_x + (int64_t)(x - t->lx0) * t->pitch_x;
     int64_t ry = t->init_y + (int64_t)(y - t->ly0) * t->pitch_y;
@@ -556,8 +654,19 @@ static void epic_vl_transform_apply(const EpicVlTransform *t,
         sx_16p16 = rx;
         sy_16p16 = ry;
     }
-    *sx = sx_16p16 >> 16;
-    *sy = sy_16p16 >> 16;
+    *sx = sx_16p16;
+    *sy = sy_16p16;
+}
+
+static void epic_vl_transform_apply(const EpicVlTransform *t,
+                                    unsigned x, unsigned y,
+                                    int32_t *sx, int32_t *sy)
+{
+    int64_t fx, fy;
+
+    epic_vl_transform_fixed(t, x, y, &fx, &fy);
+    *sx = fx >> 16;
+    *sy = fy >> 16;
 }
 
 /*
@@ -588,6 +697,7 @@ static void epic_draw_coeng_ezip_scaled(SifliEpicState *s, const EpicLayer *l,
 {
     SifliEzipFrame frame;
     unsigned x, y;
+    int32_t origin_x, origin_y;
 
     if (s->ezip == NULL || !sifli_ezip_coeng_frame(s->ezip, &frame)) {
         /* Same report as the untransformed path: nothing to sample. */
@@ -598,29 +708,67 @@ static void epic_draw_coeng_ezip_scaled(SifliEpicState *s, const EpicLayer *l,
         return;
     }
 
+    /* The HAL adds the clipped source origin to the EZIP window. */
+    epic_vl_transform_apply(t, MAX(t->lx0, cx0), MAX(t->ly0, cy0),
+                             &origin_x, &origin_y);
+
     for (y = MAX(t->ly0, cy0); y <= MIN(ly1, cy0 + ch - 1); y++) {
         for (x = MAX(t->lx0, cx0); x <= MIN(lx1, cx0 + cw - 1); x++) {
-            const uint8_t *raw;
             uint8_t *dst;
             EpicPixel px;
             int32_t sx, sy;
-            unsigned fx, fy;
+            int64_t fixed_x, fixed_y;
+            unsigned fx, fy, a;
 
-            epic_vl_transform_apply(t, x, y, &sx, &sy);
-            if (sx < (int32_t)frame.start_col ||
-                sy < (int32_t)frame.start_row) {
+            epic_vl_transform_fixed(t, x, y, &fixed_x, &fixed_y);
+            sx = fixed_x >> 16;
+            sy = fixed_y >> 16;
+            if (sx < origin_x || sy < origin_y) {
                 continue;
             }
-            fx = sx - frame.start_col;
-            fy = sy - frame.start_row;
+            fx = sx - origin_x;
+            fy = sy - origin_y;
             if (fx >= frame.width || fy >= frame.height) {
                 continue;
             }
 
-            raw = frame.pixels + ((size_t)fy * frame.width + fx) * 4;
             dst = canvas + ((y - cy0) * cw + (x - cx0)) * dst_bpp;
-            px = epic_decode_pixel(raw, EPIC_FMT_ARGB8888);
-            epic_composite(dst, o_format, EPIC_FMT_ARGB8888, px, px.a);
+            {
+                unsigned wx = (fixed_x & 0xffff) >> 8;
+                unsigned wy = (fixed_y & 0xffff) >> 8;
+                EpicPixel samples[2][2];
+                unsigned ix, iy, channel;
+
+                for (iy = 0; iy < 2; iy++) {
+                    for (ix = 0; ix < 2; ix++) {
+                        size_t pos = (size_t)MIN(fy + iy, frame.height - 1) *
+                                     frame.width +
+                                     MIN(fx + ix, frame.width - 1);
+
+                        samples[iy][ix] = epic_decode_pixel(frame.pixels +
+                                              pos * 4, EPIC_FMT_ARGB8888);
+                    }
+                }
+                for (channel = 0; channel < sizeof(px); channel++) {
+                    unsigned top = (((uint8_t *)&samples[0][0])[channel] *
+                                    (255 - wx) +
+                                    ((uint8_t *)&samples[0][1])[channel] * wx +
+                                    127) / 255;
+                    unsigned bottom = (((uint8_t *)&samples[1][0])[channel] *
+                                       (255 - wx) +
+                                       ((uint8_t *)&samples[1][1])[channel] *
+                                       wx +
+                                       127) / 255;
+
+                    ((uint8_t *)&px)[channel] =
+                        (top * (255 - wy) + bottom * wy + 127) / 255;
+                }
+            }
+            a = epic_layer_alpha(s, l, s->reg[l->cfg_off / 4],
+                                           EPIC_FMT_ARGB8888, &px);
+
+            a = epic_mask_alpha(s, l, x, y, a);
+            epic_composite(dst, o_format, EPIC_FMT_ARGB8888, px, a);
         }
     }
 }
@@ -638,8 +786,8 @@ static void epic_draw_coeng_ezip_scaled(SifliEpicState *s, const EpicLayer *l,
  * describes -- the same bound EPIC_CalcDecImgArea walks. Nothing outside it is
  * drawn.
  *
- * Sampling is nearest-neighbour: FILTER_EN is the monochrome colour
- * substitute, not an interpolation control (see the header).
+ * Memory layers interpolate colour and coverage independently.
+ * FILTER_EN controls colour-key rejection, not the sampling kernel.
  */
 static void epic_draw_layer_transformed(SifliEpicState *s, const EpicLayer *l,
                                         uint8_t *canvas, unsigned cx0,
@@ -651,12 +799,8 @@ static void epic_draw_layer_transformed(SifliEpicState *s, const EpicLayer *l,
     uint32_t misc = s->reg[SIFLI_EPIC_VL_MISC_CFG / 4];
     uint32_t extents = s->reg[SIFLI_EPIC_VL_EXTENTS / 4];
     unsigned format = cfg & EPIC_L_CFG_FORMAT_Msk;
-    unsigned src_bpp = epic_src_bpp(format);
     unsigned src_stride = (cfg & EPIC_L_CFG_WIDTH_Msk) >> EPIC_L_CFG_WIDTH_Pos;
-    unsigned alpha = (cfg & EPIC_L_CFG_ALPHA_Msk) >> EPIC_L_CFG_ALPHA_Pos;
-    bool alpha_sel = (cfg & EPIC_L_CFG_ALPHA_SEL) != 0;
-    bool blend = (cfg & EPIC_L_CFG_ALPHA_BLEND) != 0;
-    uint32_t src = sifli_sbus_to_cpu_addr(s->reg[l->src_off / 4]);
+    uint32_t src = sifli_sbus_to_mapped_cpu_addr(s->reg[l->src_off / 4]);
     unsigned max_col = (extents & EPIC_VL_EXTENTS_MAX_COL_Msk) >>
                        EPIC_VL_EXTENTS_MAX_COL_Pos;
     unsigned max_line = (extents & EPIC_VL_EXTENTS_MAX_LINE_Msk) >>
@@ -682,41 +826,64 @@ static void epic_draw_layer_transformed(SifliEpicState *s, const EpicLayer *l,
 
     for (y = MAX(t.ly0, cy0); y <= MIN(ly1, cy0 + ch - 1); y++) {
         for (x = MAX(t.lx0, cx0); x <= MIN(lx1, cx0 + cw - 1); x++) {
-            int64_t addr;
             int32_t sx, sy;
-            uint8_t raw[4];
+            int64_t fx, fy;
             EpicPixel px;
             uint8_t *dst;
             unsigned a;
 
-            epic_vl_transform_apply(&t, x, y, &sx, &sy);
+            epic_vl_transform_fixed(&t, x, y, &fx, &fy);
+            sx = fx >> 16;
+            sy = fy >> 16;
 
             /*
              * Only the region the HAL clipped -- and told the hardware about
              * through EXTENTS -- is drawn. Everything else is left as it was.
              */
             if (sx < 0 || sy < 0 || sx > (int32_t)max_col ||
-                sy > (int32_t)max_line) {
+                sy > (int32_t)max_line ||
+                (t.rotating && (sx >= (int32_t)max_col ||
+                                sy >= (int32_t)max_line))) {
                 continue;
             }
 
-            addr = (int64_t)src + (int64_t)sy * src_stride +
-                   (int64_t)sx * src_bpp;
-            if (addr < 0 || addr > UINT32_MAX ||
-                !epic_guest_read(addr, raw, src_bpp)) {
-                continue;
-            }
+            {
+                unsigned bits = t.rotating ? 12 : 8;
+                unsigned denominator = (1u << bits) - 1;
+                unsigned wx = (fx & 0xffff) >> (16 - bits);
+                unsigned wy = (fy & 0xffff) >> (16 - bits);
+                EpicPixel samples[2][2] = { 0 };
+                unsigned ix, iy, channel;
 
-            px = epic_decode_pixel(raw, format);
-            if (alpha_sel) {
-                a = alpha;
-            } else if (blend) {
-                a = px.a;
-            } else {
-                a = 255;
+                for (iy = 0; iy < 2; iy++) {
+                    for (ix = 0; ix < 2; ix++) {
+                        epic_read_pixel(src, src_stride,
+                                        MIN(sx + ix, max_col),
+                                        MIN(sy + iy, max_line), format,
+                                        &samples[iy][ix]);
+                    }
+                }
+                /* Each axis rounds separately; rotation retains 12-bit weights. */
+                for (channel = 0; channel < sizeof(px); channel++) {
+                    unsigned top = (((uint8_t *)&samples[0][0])[channel] *
+                                    (denominator - wx) +
+                                    ((uint8_t *)&samples[0][1])[channel] * wx +
+                                    denominator / 2) / denominator;
+                    unsigned bottom = (((uint8_t *)&samples[1][0])[channel] *
+                                       (denominator - wx) +
+                                       ((uint8_t *)&samples[1][1])[channel] *
+                                       wx +
+                                       denominator / 2) / denominator;
+
+                    ((uint8_t *)&px)[channel] =
+                        (top * (denominator - wy) + bottom * wy +
+                         denominator / 2) / denominator;
+                }
             }
+            a = epic_layer_alpha(s, l, cfg, format, &px);
 
             dst = canvas + ((y - cy0) * cw + (x - cx0)) * dst_bpp;
+            a = epic_mask_alpha(s, l, x, y, a);
             epic_composite(dst, o_format, format, px, a);
         }
     }
@@ -739,12 +906,8 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
     uint32_t tl = s->reg[l->tl_off / 4];
     uint32_t br = s->reg[l->br_off / 4];
     unsigned format = cfg & EPIC_L_CFG_FORMAT_Msk;
-    unsigned src_bpp = epic_src_bpp(format);
     unsigned src_stride = (cfg & EPIC_L_CFG_WIDTH_Msk) >> EPIC_L_CFG_WIDTH_Pos;
-    unsigned alpha = (cfg & EPIC_L_CFG_ALPHA_Msk) >> EPIC_L_CFG_ALPHA_Pos;
-    bool alpha_sel = (cfg & EPIC_L_CFG_ALPHA_SEL) != 0;
-    bool blend = (cfg & EPIC_L_CFG_ALPHA_BLEND) != 0;
-    uint32_t src = sifli_sbus_to_cpu_addr(s->reg[l->src_off / 4]);
+    uint32_t src = sifli_sbus_to_mapped_cpu_addr(s->reg[l->src_off / 4]);
     uint32_t coeng = s->reg[SIFLI_EPIC_COENG_CFG / 4];
     unsigned lx0 = tl & EPIC_CANVAS_X_Msk;
     unsigned ly0 = (tl & EPIC_CANVAS_Y_Msk) >> EPIC_CANVAS_Y_Pos;
@@ -797,11 +960,9 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
         return;
     }
 
-    if (src_stride == 0) {
+    if (src_stride == 0 && format != EPIC_FMT_A8) {
         /*
-         * A stride of zero is not a stride the hardware can walk, and the
-         * HAL never leaves one behind. Without it every row would land on
-         * the first, so there is nothing useful to draw.
+         * Only the constant-colour MONO encoding (A8) uses zero stride.
          */
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sifli-epic: %s is active with a zero row stride\n",
@@ -809,10 +970,11 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
         return;
     }
     if (format != EPIC_FMT_RGB565 && format != EPIC_FMT_RGB888 &&
-        format != EPIC_FMT_ARGB8888 && format != EPIC_FMT_ARGB8565) {
+        format != EPIC_FMT_ARGB8888 && format != EPIC_FMT_ARGB8565 &&
+        format != EPIC_FMT_A8 && format != EPIC_FMT_A4 &&
+        format != EPIC_FMT_A2) {
         /*
-         * A8/A4/A2/L8 want the colour coordinate engine, the palette or the
-         * mask registers, none of which are modelled.
+         * L8 needs the palette, which is not modelled.
          */
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sifli-epic: %s uses source format %u, which is not "
@@ -833,26 +995,27 @@ static void epic_draw_layer(SifliEpicState *s, const EpicLayer *l,
 
     for (y = MAX(ly0, cy0); y <= MIN(ly1, cy0 + ch - 1); y++) {
         for (x = MAX(lx0, cx0); x <= MIN(lx1, cx0 + cw - 1); x++) {
-            uint32_t src_addr = src + (y - ly0) * src_stride +
-                                (x - lx0) * src_bpp;
-            uint8_t raw[4];
             EpicPixel px;
             uint8_t *dst = canvas + ((y - cy0) * cw + (x - cx0)) * dst_bpp;
             unsigned a;
 
-            if (!epic_guest_read(src_addr, raw, src_bpp)) {
+            if (!epic_read_pixel(src, src_stride, x - lx0, y - ly0,
+                                 format, &px)) {
                 continue;
             }
-            px = epic_decode_pixel(raw, format);
 
-            if (alpha_sel) {
-                a = alpha;
-            } else if (blend) {
-                a = px.a;
-            } else {
-                a = 255;
+            if (cfg & EPIC_L_CFG_FILTER_EN) {
+                uint32_t filter = s->reg[(l->transformable ?
+                    SIFLI_EPIC_VL_FILTER : SIFLI_EPIC_L0_FILTER) / 4];
+                uint32_t rgb = (px.r << 16) | (px.g << 8) | px.b;
+
+                if (!(filter >> 24) && rgb == (filter & 0xffffff)) {
+                    continue;
+                }
             }
+            a = epic_layer_alpha(s, l, cfg, format, &px);
 
+            a = epic_mask_alpha(s, l, x, y, a);
             epic_composite(dst, o_format, format, px, a);
         }
     }
@@ -878,10 +1041,8 @@ static void epic_run(SifliEpicState *s)
     /*
      * The colour the canvas is cleared to, which is also the fill colour: an
      * opaque fill programs no layer at all, just CANVAS_BG and this
-     * rectangle. Either bypass bit says the canvas is meant to be read, not
-     * painted -- the copy path sets ALL_BLENDING_BYPASS and leaves a zero
-     * CANVAS_BG behind, so clearing would erase the destination it is about
-     * to read.
+     * rectangle. ALL_BLENDING_BYPASS preserves the destination, while
+     * BG_BLENDING_BYPASS excludes the constant background for alpha output.
      */
     bool clear_canvas = !(bg & (EPIC_CANVAS_BG_BG_BLENDING_BYPASS |
                                 EPIC_CANVAS_BG_ALL_BLENDING_BYPASS));
@@ -938,6 +1099,10 @@ static void epic_run(SifliEpicState *s)
             return;
         }
 
+        if (!clear_canvas &&
+            !(bg & EPIC_CANVAS_BG_ALL_BLENDING_BYPASS)) {
+            memset(p, 0, row_bytes);
+        }
         if (clear_canvas) {
             unsigned x;
 

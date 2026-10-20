@@ -222,10 +222,10 @@ static void sifli_lcdc_write_single(SifliLcdcState *s, uint32_t v)
  * through HCPU_MPI_SBUS_ADDR() (bf0_hal_lcdc.c:1727), which lifts the MPI
  * CBUS window -- flash -- by 0x50000000 so the memory interface can tell an
  * external access from a CPU one. This model reads guest memory the way the
- * CPU sees it, so it undoes that with sifli_sbus_to_cpu_addr() -- the same
- * translation EPIC's layer sources need (peripherals.md §8.2). PSRAM and
- * SRAM sit outside the window and pass through untouched, which is where
- * every framebuffer in this tree lives.
+ * CPU sees it, so it resolves the mapped flash alias with the same
+ * translation EPIC's layer sources need (peripherals.md §8.2). PSRAM may
+ * overlap the SBUS window on NOR boards, so only mapped ROM aliases are
+ * translated; framebuffers in RAM pass through untouched.
  */
 
 static uint16_t sifli_lcdc_to_rgb565(const uint8_t *p, unsigned format)
@@ -305,7 +305,7 @@ static void sifli_lcdc_send_frame(SifliLcdcState *s)
                                 LCDC_LAYER0_FORMAT_LEN);
     uint32_t stride = extract32(cfg, LCDC_LAYER0_WIDTH_Pos,
                                 LCDC_LAYER0_WIDTH_LEN);
-    uint32_t src = sifli_sbus_to_cpu_addr(s->regs[LCDC_LAYER0_SRC]);
+    uint32_t src = sifli_sbus_to_mapped_cpu_addr(s->regs[LCDC_LAYER0_SRC]);
     unsigned x0 = extract32(s->regs[LCDC_LAYER0_TL_POS], LCDC_LAYER_X_Pos,
                             LCDC_LAYER_XY_LEN);
     unsigned y0 = extract32(s->regs[LCDC_LAYER0_TL_POS], LCDC_LAYER_Y_Pos,

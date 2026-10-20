@@ -316,10 +316,10 @@ static bool ezip_decode_lz4(const uint8_t *in, size_t in_len, EzipBuffer *out)
  * bitstream are harmless -- the bitstream says how long it is, and feeding
  * it 4K of erased flash still produced identical pixels.
  */
-static bool ezip_decode_proprietary(SifliEzipState *s, const uint8_t *in,
+static bool ezip_decode_proprietary_pixels(SifliEzipState *s, const uint8_t *in,
                                     size_t in_len, EzipBuffer *out,
                                     unsigned *db_width, unsigned *db_height,
-                                    unsigned *db_format)
+                                    unsigned *db_format, bool rgb888)
 {
     g_autofree char *tmpdir = NULL;
     g_autofree char *in_dir = NULL;
@@ -387,7 +387,7 @@ static bool ezip_decode_proprietary(SifliEzipState *s, const uint8_t *in,
     argv[argc++] = "-spt";
     argv[argc++] = "1";
     argv[argc++] = "-dpt";
-    argv[argc++] = "1";
+    argv[argc++] = rgb888 ? "0" : "1";
     argv[argc++] = "-binfile";
     argv[argc++] = "1";
     argv[argc++] = "-dec_off_no_header";
@@ -463,6 +463,64 @@ out:
         g_rmdir(tmpdir);
     }
     return ok;
+}
+
+/*
+ * The vendor decoder drops the alpha of RGBA palette streams (type 0x13),
+ * and its RGB565 conversion corrupts palette colours. Use RGB888 for colour.
+ * Decode a second palette with alpha stored as RGB888 grayscale, then use
+ * its green channel as the exact original coverage byte.
+ */
+static bool ezip_decode_proprietary(SifliEzipState *s, const uint8_t *in,
+                                    size_t in_len, EzipBuffer *out,
+                                    unsigned *width, unsigned *height,
+                                    unsigned *format)
+{
+    EzipBuffer alpha = { 0 };
+    g_autofree uint8_t *masked = NULL;
+    g_autofree uint8_t *rgba = NULL;
+    unsigned count, i, aw, ah, af;
+    size_t pixels;
+    bool ok;
+    bool palette = in_len >= 16 && in[4] == 0x13;
+
+    if (!ezip_decode_proprietary_pixels(s, in, in_len, out,
+                                        width, height, format, palette)) {
+        return false;
+    }
+    if (!palette) {
+        return true;
+    }
+    count = lduw_be_p(in + 12);
+    if (!count || count > 256 || 16 + count * 4 > in_len) {
+        return false;
+    }
+    masked = g_memdup2(in, in_len);
+    for (i = 0; i < count; i++) {
+        unsigned a = in[16 + i * 4 + 3];
+        memset(masked + 16 + i * 4, a, 3);
+        masked[16 + i * 4 + 3] = 255;
+    }
+    ok = ezip_decode_proprietary_pixels(s, masked, in_len, &alpha,
+                                        &aw, &ah, &af, true);
+    pixels = (size_t)*width * *height;
+    if (!ok || aw != *width || ah != *height ||
+        alpha.len != pixels * 3 || out->len != pixels * 3) {
+        g_free(alpha.data);
+        return false;
+    }
+    rgba = g_malloc(pixels * 4);
+    for (i = 0; i < pixels; i++) {
+        /* RGB888 tool output is R,G,B; the co-engine frame is B,G,R,A. */
+        rgba[i * 4] = out->data[i * 3 + 2];
+        rgba[i * 4 + 1] = out->data[i * 3 + 1];
+        rgba[i * 4 + 2] = out->data[i * 3];
+        rgba[i * 4 + 3] = alpha.data[i * 3 + 1];
+    }
+    g_free(alpha.data);
+    out->len = 0;
+    *format = EZIP_PIXEL_FMT_TRUE_COLOR_ALPHA;
+    return ezip_buffer_append(out, rgba, pixels * 4);
 }
 
 /* ------------------------------------------------------------------ */
@@ -685,7 +743,8 @@ static void ezip_complete_run(SifliEzipState *s, bool out_epic,
 static void ezip_run(SifliEzipState *s)
 {
     uint32_t para = s->reg[SIFLI_EZIP_PARA / 4];
-    uint32_t src = sifli_sbus_to_cpu_addr(s->reg[SIFLI_EZIP_SRC_ADDR / 4]);
+    uint32_t src = sifli_sbus_to_mapped_cpu_addr(
+                       s->reg[SIFLI_EZIP_SRC_ADDR / 4]);
     uint32_t dst = s->reg[SIFLI_EZIP_DST_ADDR / 4];
     unsigned mode = (para & EZIP_PARA_MOD_SEL) >> 1;
     /* Output to EPIC feeds the 2D pipeline's input instead of memory. */
@@ -954,8 +1013,9 @@ static const Property sifli_ezip_properties[] = {
      * "ezip-tool" property and SIFLI_EZIP_TOOL are the ways in.
      */
     DEFINE_PROP_STRING("tool", SifliEzipState, tool),
+    /* Full-screen EZIP images (e.g. watch dial) exceed 64 KiB compressed. */
     DEFINE_PROP_UINT32("window-bytes", SifliEzipState, window_bytes,
-                       64 * 1024),
+                       1024 * 1024),
 };
 
 static void sifli_ezip_class_init(ObjectClass *klass, const void *data)

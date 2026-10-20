@@ -155,13 +155,7 @@ enum {
 #define EPIC_L_CFG_WIDTH_Msk        (0x1fffu << 16)
 #define EPIC_L_CFG_ACTIVE           BIT(30)
 #define EPIC_L_CFG_ALPHA_BLEND      BIT(31)
-/*
- * CFG.FILTER_EN only ever accompanies the FILTER register's RGB, which the
- * HAL uses to substitute a colour for the ones an A8/L8 source cannot carry
- * (bf0_hal_epic.c:3128). It is not a resampling filter: no register selects
- * an interpolation kernel for the scaler, so a scaled VL layer is sampled
- * nearest-neighbour.
- */
+/* CFG.FILTER_EN enables RGB colour-key rejection, not scaler interpolation. */
 #define EPIC_L_CFG_FILTER_EN        BIT(15)
 
 /* Source pixel formats, from EPIC_L0_CFG_FMT_*. */
@@ -193,6 +187,14 @@ enum {
 #define EPIC_COENG_CFG_EZIP_EN          BIT(0)
 #define EPIC_COENG_CFG_EZIP_CH_SEL_Pos  1
 #define EPIC_COENG_CFG_EZIP_CH_SEL_Msk  (3u << 1)
+
+#define EPIC_MASK_CFG_A4                BIT(0)
+#define EPIC_MASK_CFG_OVERWRITE         BIT(1)
+#define EPIC_MASK_CFG_L0_EN             BIT(2)
+#define EPIC_MASK_CFG_VL_EN             BIT(5)
+#define EPIC_MASK_CFG_WIDTH_Pos         14
+#define EPIC_MASK_CFG_WIDTH_Msk         (0x1fffu << 14)
+#define EPIC_MASK_CFG_ACTIVE            BIT(28)
 
 /*
  * The VL transform registers. VL is the only layer on 52x with them: L0 has

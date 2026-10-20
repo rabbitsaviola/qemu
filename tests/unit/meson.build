@@ -49,6 +49,7 @@ tests = {
   'test-interval-tree': [],
   'test-fifo': [],
   'test-envlist': [],
+  'test-sifli-sbus': [],
 }
 
 if have_system or have_tools
